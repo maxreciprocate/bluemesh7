@@ -1,0 +1,5 @@
+[deps]
+Agents = "46ada45e-f475-11e8-01d0-f70cc89e6671"
+AgentsPlots = "7820620d-95fb-4739-93b3-b0a14dd83f9a"
+GraphPlot = "a2cc645c-3eea-5389-862e-a155d0052231"
+LightGraphs = "093fc24a-ae57-5d10-9952-331d41423f4d"
