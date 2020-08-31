@@ -2,10 +2,10 @@
 
 ![](graph.png)
 
-## Run an experiment
+## Try it out (via [Julia 1.5](https://julialang.org/downloads/))
 
 ```bash
-julia -e 'using Pkg; Pkg.activate(); Pkg.instantiate()' # install dependencies
+julia --project -e 'using Pkg; Pkg.activate(); Pkg.instantiate()' # install dependencies
 
 julia --project run.jl
 ```
