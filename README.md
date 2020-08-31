@@ -9,3 +9,13 @@ julia --project -e 'using Pkg; Pkg.activate(); Pkg.instantiate()' # install depe
 
 julia --project run.jl
 ```
+
+## Try python interface (after following the steps above)
+
+```bash
+python3 -m pip install --user julia
+
+python3 -c "import julia; julia.install()"
+
+python3 run.py
+```
