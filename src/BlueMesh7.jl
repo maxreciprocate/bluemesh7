@@ -11,7 +11,6 @@ mutable struct Packet
     src::UInt16
     dst::UInt16
     ttl::UInt8
-    time::UInt
 end
 
 Base.@kwdef mutable struct Node <: AbstractAgent
@@ -35,6 +34,9 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     # whether the device is currently sending data (this removes the need for redundant allocations)
     transmitting :: Bool = false
 
+    # the power of the transmission
+    dBm :: Int = 4
+
     # the length of the interval between transmissions on different channels (ms)
     t_interpdu :: UInt = 5
 
@@ -45,7 +47,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     t_back_off_delay :: UInt = 5
 
     # the number of extra retransmissions of the received packet
-    n_retx_transmit_count :: UInt = 1
+    n_retx_transmit_count :: UInt = 0
 
     # the length of the delay between bonus transmissions of the received packet (ms)
     t_retx_transmit_delay :: UInt = 20
@@ -72,7 +74,9 @@ Base.@kwdef mutable struct Source <: AbstractAgent
 
     channel :: UInt8 = 37
     event_start :: UInt = 0
+    dBm :: Int = 3
     transmitting :: Bool = false
+
     t_interpdu :: UInt = 5
 
     # the number of extra transmissions of the packet originating from the node
@@ -88,18 +92,16 @@ Base.@kwdef mutable struct Source <: AbstractAgent
     n_transmit_left :: UInt = 0
 
     packet :: Union{Packet, Nothing} = nothing
-    packet_seq :: UInt = 0
 end
 
 function agent_step!(source::Source, model::AgentBasedModel)
-    if rand() < model.emit_rate && source.packet === nothing
+    if rand() < model.packet_emit_rate
         # move off to a random position
         move_agent!(source, model)
 
-        source.packet = Packet(source.packet_seq, source.id, rand(2:nagents(model)), model.ttl, model.tick)
+        source.packet = Packet(model.tick, source.id, rand(2:nagents(model)), model.ttl)
         source.event_start = model.tick
 
-        source.packet_seq += 1
         model.produced += 1
     end
 
@@ -212,24 +214,20 @@ end
 distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2)
 
 function model_step!(model::AgentBasedModel)
-    for src in allagents(model)
-        src.transmitting || continue
+    transmitters = filter(agent -> agent.transmitting, collect(allagents(model)))
 
-        for dst in allagents(model)
-            if distance(src.pos, dst.pos) < 50 && dst.state == :scanning && dst.channel == src.channel
-                rand() < model.packet_error_rate && continue
+    for dst in allagents(model)
+        dst.state == :scanning || continue
 
-                dst.packet = deepcopy(src.packet)
-            end
-        end
+        neighbours = filter(src -> distance(src.pos, dst.pos) < exp(src.dBm), transmitters)
+        0 < length(neighbours) < 3 || continue
+
+        rand() < model.packet_error_rate && continue
+
+        dst.packet = deepcopy(rand(neighbours).packet)
     end
 
     model.tick += 1
-end
-
-function plotgrid(model::AgentBasedModel)
-    ac(n::Node) = n.role === :relay ? :orange : :darkblue
-    plotabm(model; ac, aspect_ratio=:equal, size = (600, 600), yflip=true, showaxis=false)
 end
 
 function plotgraph(model::AgentBasedModel)
@@ -243,10 +241,12 @@ function plotgraph(model::AgentBasedModel)
         end
     end
 
+    colors = Dict(:relay => "orange", :sink => "darkblue", :source => "transparent")
+
     agents = sort(collect(allagents(model)), by=a -> a.id)
     xs = map(a -> a.pos[1], agents)
     ys = map(a -> a.pos[2], agents)
-    cs = map(a -> a.role == :relay ? "orange" : "darkblue", agents)
+    cs = map(a -> colors[a.role], agents)
 
     gplot(g, xs, ys; nodefillc = cs)
 end
@@ -254,19 +254,19 @@ end
 """
     generate_graph(; dims = (200, 200), n_nodes = 100, power_distance = 50) → adjacency, positions
 
-Generates a random graph and returns the adjacency matrix and xy-coordinates of nodes
+Generates a random graph and returns the adjacency matrix and xy-coordinates of the nodes
 """
 function generate_graph(; dims = (100, 100), n_nodes = 64, power_distance = 50)
-    xys = [(rand(1:dims[1]), rand(1:dims[2])) for _ in 1:n_nodes]
+    positions = [(rand(1:dims[1]), rand(1:dims[2])) for _ in 1:n_nodes]
     g = SimpleGraph(n_nodes)
 
-    for src in eachindex(xys), dst in src+1:n_nodes
-        if distance(xys[src], xys[dst]) <= power_distance
+    for src in 1:n_nodes, dst in src+1:n_nodes
+        if distance(positions[src], positions[dst]) <= power_distance
             add_edge!(g, src, dst)
         end
     end
 
-    Matrix(adjacency_matrix(g)), xys
+    positions, Matrix(adjacency_matrix(g))
 end
 
 """
@@ -280,7 +280,7 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     properties = Dict(
         :tick => 0,
         :packet_error_rate => 0.05,
-        :emit_rate => 10 / 1000,
+        :packet_emit_rate => 10 / 1000,
         :ttl => 4,
         :received => 0,
         :produced => 0
