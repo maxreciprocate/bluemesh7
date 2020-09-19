@@ -13,7 +13,7 @@ BlueMesh7 = Main.BlueMesh7
 
 import numpy as np
 
-positions, adjacency_matrix = BlueMesh7.generate_graph()
+positions = BlueMesh7.generate_positions()
 
 node_roles = np.ones(len(positions), dtype='i8')
 mesh = BlueMesh7.initialize_mesh(positions, node_roles)

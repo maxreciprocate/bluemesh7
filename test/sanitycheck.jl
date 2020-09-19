@@ -1,11 +1,11 @@
 include("../src/BlueMesh7.jl")
-using .BlueMesh7: generate_graph, initialize_mesh, start, plotgraph
+using .BlueMesh7: generate_graph, initialize_mesh, start, plotgrid
 using Random
 
 minutes = 20
 
 Random.seed!(7)
-positions, _ = generate_graph()
+positions = generate_positions()
 
 node_roles = zeros(Int, length(positions))
 mesh = initialize_mesh(positions, node_roles)
