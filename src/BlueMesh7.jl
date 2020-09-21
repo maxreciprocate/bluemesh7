@@ -10,6 +10,7 @@ mutable struct Packet
     seq::Int
     src::UInt16
     dst::UInt16
+    last::UInt16
     ttl::UInt8
 end
 
@@ -29,7 +30,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     state :: Symbol = :scanning
 
     # the time of the event's (current state) begging
-    event_start :: UInt = 0
+    event_start :: Int = rand(0:10)
 
     # whether the device is currently sending data (this removes the need for redundant allocations)
     transmitting :: Bool = false
@@ -47,7 +48,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     t_back_off_delay :: UInt = 5
 
     # the number of extra retransmissions of the received packet
-    n_retx_transmit_count :: UInt = 0
+    n_retx_transmit_count :: UInt = 1
 
     # the length of the delay between bonus transmissions of the received packet (ms)
     t_retx_transmit_delay :: UInt = 20
@@ -74,7 +75,7 @@ Base.@kwdef mutable struct Source <: AbstractAgent
 
     channel :: UInt8 = 37
     event_start :: UInt = 0
-    dBm :: Int = 3
+    dBm :: Int = 4
     transmitting :: Bool = false
 
     t_interpdu :: UInt = 5
@@ -99,9 +100,11 @@ function agent_step!(source::Source, model::AgentBasedModel)
         # move off to a random position
         move_agent!(source, model)
 
-        source.packet = Packet(model.tick, source.id, rand(2:nagents(model)), model.ttl)
+        source.packet = Packet(model.tick, source.id, rand(1:nagents(model)-1), source.id, model.ttl)
         source.event_start = model.tick
 
+        model.travelling_packets[source.packet.seq] = Int[]
+        # @show source.packet.seq, source.packet.dst
         model.produced += 1
     end
 
@@ -128,7 +131,7 @@ end
 function agent_step!(node::Node, model::AgentBasedModel)
     if node.state == :scanning
         # scanning happens every tick (assuming here scan_window == scan_interval)
-        node.channel = div(model.tick - node.event_start, node.t_scan_interval) + 37
+        node.channel = div(abs(model.tick - node.event_start), node.t_scan_interval) + 37
 
         # no packets acquired, repeat
         if node.channel > 39
@@ -147,10 +150,9 @@ function agent_step!(node::Node, model::AgentBasedModel)
 
         push!(node.received_packets, node.packet.seq)
 
+        # already delivered
         if node.packet.dst == node.id
-            model.received += 1
             node.packet = nothing
-
             return
         end
 
@@ -158,6 +160,13 @@ function agent_step!(node::Node, model::AgentBasedModel)
             node.packet = nothing
 
             return
+        end
+
+        # registering the touch upon this yet not delivered packet
+        seq = node.packet.seq
+        if haskey(model.travelling_packets, seq)
+            # println("$(node.id) registering $(seq)")
+            push!(model.travelling_packets[seq], node.id)
         end
 
         node.packet.ttl -= 1
@@ -184,10 +193,13 @@ function agent_step!(node::Node, model::AgentBasedModel)
             return
         end
 
-        d, r = divrem(model.tick - node.event_start, node.t_interpdu)
+        d, r = divrem(abs(model.tick - node.event_start), node.t_interpdu)
 
         # transmitting happens once for each channel
         node.transmitting = iszero(r)
+        # if node.transmitting
+        #     println("$(node.id) broadcasting $(node.packet.seq)")
+        # end
 
         node.channel = d + 37
 
@@ -211,32 +223,53 @@ function agent_step!(node::Node, model::AgentBasedModel)
     end
 end
 
+power_to_distance(dBm::Int) = exp(dBm)
 distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2)
 
 function model_step!(model::AgentBasedModel)
     transmitters = filter(agent -> agent.transmitting, collect(allagents(model)))
 
+    empty!(model.reward_plate)
+
     for dst in allagents(model)
         dst.state == :scanning || continue
 
-        neighbours = filter(src -> distance(src.pos, dst.pos) < exp(src.dBm), transmitters)
-        0 < length(neighbours) < 3 || continue
+        neighbours = filter(src -> distance(src.pos, dst.pos) < power_to_distance(src.dBm) && src.channel == dst.channel, transmitters)
+        length(neighbours) != 1 && continue
 
         rand() < model.packet_error_rate && continue
 
-        dst.packet = deepcopy(rand(neighbours).packet)
+        packet = first(neighbours).packet
+        # marking the packet as delivered before the actor himself has even noticed
+        if dst.id == packet.dst && haskey(model.travelling_packets, packet.seq)
+            append!(model.reward_plate, model.travelling_packets[packet.seq])
+            delete!(model.travelling_packets, packet.seq)
+
+            model.received += 1
+        end
+
+        dst.packet = deepcopy(first(neighbours).packet)
+        dst.packet.last = first(neighbours).id
+    end
+
+    for seq in keys(model.travelling_packets)
+        if model.tick - seq > 300
+            delete!(model.travelling_packets, seq)
+        end
     end
 
     model.tick += 1
 end
 
+
 function plotgraph(model::AgentBasedModel)
-    g = SimpleGraph(nagents(model))
+    g = SimpleGraph(nagents(model) - 1)
 
     for src in allagents(model), dst in allagents(model)
         src.role == :relay || continue
+        dst.role != :source || continue
 
-        if distance(src.pos, dst.pos) < 50
+        if distance(src.pos, dst.pos) <= power_to_distance(src.dBm)
             add_edge!(g, src.id, dst.id)
         end
     end
@@ -244,6 +277,7 @@ function plotgraph(model::AgentBasedModel)
     colors = Dict(:relay => "orange", :sink => "darkblue", :source => "transparent")
 
     agents = sort(collect(allagents(model)), by=a -> a.id)
+    filter!(a -> a.role != :source, agents)
     xs = map(a -> a.pos[1], agents)
     ys = map(a -> a.pos[2], agents)
     cs = map(a -> colors[a.role], agents)
@@ -252,16 +286,16 @@ function plotgraph(model::AgentBasedModel)
 end
 
 """
-    generate_graph(; dims = (200, 200), n_nodes = 100, power_distance = 50) → adjacency, positions
+    generate_graph(; dims = (200, 200), n_nodes = 100) → adjacency, positions
 
 Generates a random graph and returns the adjacency matrix and xy-coordinates of the nodes
 """
-function generate_graph(; dims = (100, 100), n_nodes = 64, power_distance = 50)
+function generate_graph(; dims = (100, 100), n_nodes = 64)
     positions = [(rand(1:dims[1]), rand(1:dims[2])) for _ in 1:n_nodes]
     g = SimpleGraph(n_nodes)
 
     for src in 1:n_nodes, dst in src+1:n_nodes
-        if distance(positions[src], positions[dst]) <= power_distance
+        if distance(positions[src], positions[dst]) <= exp(4)
             add_edge!(g, src, dst)
         end
     end
@@ -270,7 +304,7 @@ function generate_graph(; dims = (100, 100), n_nodes = 64, power_distance = 50)
 end
 
 """
-    initialize_mesh(roles::Vector{Int}, positions::Vector{Tuple{Int, Int}}) → mesh::AgentBasedModel
+    initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int}) → mesh::AgentBasedModel
 
 Create a mesh by specifying roles of each node by `roles`=[0, 1, 0...] where 1 means that the node is a relay, sink otherwise, and including `positions`=[(Int, Int)...] as nodes' positions
 """
@@ -280,22 +314,26 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     properties = Dict(
         :tick => 0,
         :packet_error_rate => 0.05,
-        :packet_emit_rate => 10 / 1000,
+        :packet_emit_rate => 5 / 1000,
         :ttl => 4,
         :received => 0,
-        :produced => 0
+        :produced => 0,
+        # packet.seq => nodes that touched that packet
+        :travelling_packets => Dict{Int, Vector{Int}}(),
+        # plate for the actors who contributed to packet's successful delivery
+        :reward_plate => Int[]
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))), moore = true)
     model = ABM(Union{Source, Node}, space; properties, warn = false)
 
-    for (role_i, pos) in zip(roles, positions)
-        node = Node(id = nextid(model); pos, role = role_i == 1 ? :relay : :sink)
+    for (pos, roles_i) in zip(positions, roles)
+        node = Node(id = nextid(model); pos, role = roles_i == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
     end
 
-    add_agent_single!(Source(id = 1, pos = (1, 1)), model)
+    add_agent_single!(Source(id = 0, pos = (1, 1)), model)
 
     model
 end
@@ -308,8 +346,8 @@ Start an experiment from `model` for the given number of minutes.
 function start(model::AgentBasedModel; minutes = 1)
     steps = minutes * 60 * 1000
 
-    _, dfm = run!(model, agent_step!, model_step!, steps; when_model = [steps], mdata = [:produced, :received])
+    _, dfm = run!(model, agent_step!, model_step!, steps)
 
-    dfm[:produced][1], dfm[:received][1]
+    model.produced - count(kv -> isempty(last(kv)), mesh.travelling_packets), model.received
 end
 end
