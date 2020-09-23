@@ -5,8 +5,14 @@ using Random
 using StatsBase
 include("MeshAgents.jl")
 using .MeshAgents: Node, Source, Packet
+using Distributions
+using LoopVectorization
 
 export generate_positions, initialize_mesh, run, plotgrid
+
+const ble_37_channel_wavelength = Float64(0.12491352)
+const part_of_path_loss_for_37 = Float64(20 * log(10, 4 * π / ble_37_channel_wavelength))
+const Standard_Normal_d = Normal()
 
 function agent_step!(source::Source, model::AgentBasedModel)
     if rand() < model.packet_emit_rate
@@ -127,86 +133,127 @@ end
 
 distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2)
 
-function calc_rssi!(agents::Array{Union{Node, Source}, 1})
+function vmap!(arr::SubArray, func::Function, arr2::SubArray)
+    length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
+    @avx for i in 1:length(arr)
+        arr2[i] = func(arr[i])
+    end
+    arr2
+end
+
+function vmap!(arr::SubArray, func::Function)
+    length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
+    arr2 = Array{typeof(func(arr[1])), 1}(undef, length(arr))
+    @avx for i in 1:length(arr)
+        arr2[i] = func(arr[i])
+    end
+    arr2
+end
+
+function calc_rssi!(agents::Array{Union{Node, Source}, 1}, P_tx::Array{Float64, 1})
     n = length(agents)
     rssi_map = Matrix{Float64}(undef, n, n)
 
-    ble_37_channel_wavelength = 0.12491352
-    path_loss_multiplier = 4 * π / ble_37_channel_wavelength
+    L_p = Matrix{Float64}(undef, n, n)
 
     for i in 1:n
+        for j in 1:(i - 1) # more cache-friendly
+            L_p[i, j] = L_p[j, i]
+        end
+
+        for j in (i + 1):n
+            L_p[i, j] = log(10, max(distance(agents[i].pos, agents[j].pos), 1e-9))
+        end
+    end
+
+    @avx for i in 1:n
         for j in 1:n
-            if i == j
-                rssi_map[i, i] = -Inf
-                continue
-            end
-
-            rssi_map[i, j] = min(agents[j].tx_power - (20 * log(
-                10, max(path_loss_multiplier * distance(agents[i].pos, agents[j].pos), 1e-9)
-            )), 0) # dBm
+            rssi_map[i, j] = P_tx[j] - 20 * L_p[i, j] - part_of_path_loss_for_37 # dB
         end
+
+        rssi_map[i, i] = -Inf
     end
 
     rssi_map
 end
 
-function recalc_sources_rssi!(agents::Array{Union{Node, Source}, 1}, sources::Array{Int, 1})
-    global rssi_map
+function recalc_sources_rssi!(agents::Array{Union{Node, Source}, 1}, sources::Array{Int, 1},
+        rssi_map::Matrix{Float64}, P_tx::Array{Float64, 1})
+    n = length(agents)
 
-    ble_37_channel_wavelength = 0.12491352
-    path_loss_multiplier = 4 * π / ble_37_channel_wavelength
+    for i in sources
+        Lps = vmap!(view(agents, 1:n), x -> (log(10, max(distance(agents[i].pos, x.pos), 1e-9))))
 
-    for source_idx in sources
-       for i in 2:length(agents)
-             rssi_map[source_idx, i] = min(agents[source_idx].tx_power - (20 * log(
-                10, max(path_loss_multiplier * distance(agents[source_idx].pos, agents[i].pos), 1e-9)
-            )), 0) # dBm
+        @avx for j in 1:n
+            Lps[j] = 20 * Lps[j] + part_of_path_loss_for_37
+            rssi_map[i, j] = P_tx[j] - Lps[j] # dB
         end
+
+        @avx for j in 1:n
+            rssi_map[j, i] = P_tx[i] - Lps[j] # dB
+        end
+
+        rssi_map[i, i] = -Inf
+
     end
 
     rssi_map
 end
-
-# optimization for static mesh
-rssi_map = Matrix{Float64}(undef, 0, 0)
 
 function model_step!(model::AgentBasedModel)
     all_agents = collect(allagents(model))
-    scanners = filter(i -> all_agents[i].state == :scanning, 1:length(all_agents))
-    transmitters = filter(i -> all_agents[i].transmitting, 1:length(all_agents))
+    n = length(all_agents)
+    scanners = [i for i in 1:n if all_agents[i].state == :scanning]
+    transmitters = [i for i in 1:n if all_agents[i].transmitting]
 
-    scanner_sensitivity = -95 # dBm
-    wifi_rssi           = -70 # dBm
-    gaussian_noise      = -90 # dBm
+    recalc_sources_rssi!(all_agents, model.source_nodes, model.rssi_map, model.tx_powers)
 
-    global rssi_map
-    sources = [1]
-    rssi_map = length(rssi_map) > 0 ? recalc_sources_rssi!(all_agents, sources) : calc_rssi!(all_agents)
+    # LoopVectorization definetely not perfect
+    shadow_d = model.shadow_d
+    multipath_d = model.multipath_d
+    msg_bit_length = model.msg_bit_length
 
-    for scanner in scanners
+    for scanner_i in scanners
         # since we support just 1 message within scanning period
-        all_agents[scanner].packet == nothing || continue
+        all_agents[scanner_i].packet == nothing || continue
 
-        neighbours_i = [i for i in transmitters if rssi_map[scanner, i] > scanner_sensitivity]
+        neighbours_i = [i for i in transmitters if (model.tx_powers[i] > model.scanner_sensitivity && all_agents[i].channel == all_agents[scanner_i].channel)]
 
         length(neighbours_i) > 0 || continue
 
-        neighbours_probs = [
-            rssi_map[neighbours_i]...,
-            wifi_rssi + rand(-20:20),
-            gaussian_noise + rand(-10:10)
-        ]
+        neighbours = model.rssi_map[scanner_i, neighbours_i]
 
-        # add dummy indexes for wifi and noise
-        append!(neighbours_i, [0, 0])
+        n_n = length(neighbours)
 
-        neighbours_probs /= sum(neighbours_probs)
+        total = Float64(1e-10)
+        # add random noises to calculate RSSI
+        @avx for i in 1:n_n
+            neighbours[i] -= rand(shadow_d) + rand(multipath_d)
+            total += neighbours[i]
+        end
 
-        tx_i = StatsBase.sample(neighbours_i, StatsBase.ProbabilityWeights(neighbours_probs))
+        total += rand(model.wifi_noise_d) + rand(model.gaussian_noise)
 
-        tx_i > 0 || continue
+        # calculate SINR and take sqrt
+        @avx for i in 1:n_n
+            neighbours[i] = sqrt(neighbours[i] / (total - neighbours[i]))
+        end
 
-        all_agents[scanner].packet = deepcopy(all_agents[tx_i].packet)
+        # calculate BER
+        #println(neighbours)
+        neighbours = cdf.(Standard_Normal_d, neighbours)
+
+        # calculate PAR (Package Accept Rate) (PAR = 1 - PER)
+        total_PAR = Float64(0.0)
+        @avx for i in 1:n_n
+            neighbours[i] = (1 - neighbours[i]) ^ msg_bit_length
+            total_PAR += neighbours[i]
+        end
+
+        if rand() <= total_PAR  # then we will receive message
+            tx_i = StatsBase.sample(neighbours_i, Weights(neighbours))
+            all_agents[scanner_i].packet = deepcopy(all_agents[tx_i].packet)
+        end
     end
 
     model.tick += 1
@@ -241,27 +288,44 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     length(roles) == length(positions) || throw(ArgumentError("Both arguments must be of equal length"))
 
     properties = Dict(
-        :tick => 0,
-        :packet_error_rate => 0.05,
-        :packet_emit_rate => 10 / 1000,
-        :ttl => 4,
-        :received => 0,
-        :produced => 0
+        :tick                   => 0,
+        :packet_error_rate      => 0.05,
+        :packet_emit_rate       => 10 / 1000,
+        :ttl                    => 4,
+        :msg_bit_length         => 312,
+        :received               => 0,
+        :produced               => 0,
+        :rssi_map               => Matrix{Float64}(undef, 0, 0),
+        :source_nodes           => Array{Int64, 1}(),
+        :tx_powers              => Array{Float64, 1}(undef, length(roles)),
+        :scanner_sensitivity    => -95, # db
+        :shadow_d               => LogNormal(0, 4),
+        :multipath_d            => Rayleigh(4),
+        :wifi_noise_d           => Normal(-70, 20),
+        :gaussian_noise         => Normal(-90, 5)
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))), moore = true)
     model = ABM(Union{Source, Node}, space; properties, warn = false)
 
-    add_agent_single!(Source(id = 1, pos = (1, 1)), model)
+    model.source_nodes = [1]
+    source = Source(id = 1, pos = (1, 1))
+    add_agent_single!(source, model)
+    model.tx_powers[1] = source.tx_power
 
     for i in 2:length(roles)
         node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
+
+        model.tx_powers[i] = node.tx_power
     end
+
+    model.rssi_map = calc_rssi!(collect(allagents(model)), model.tx_powers)
 
     model
 end
+
 
 """
     start(model::AgentBasedModel, minutes = 1) → (received, produced)
