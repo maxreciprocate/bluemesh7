@@ -7,6 +7,7 @@ include("MeshAgents.jl")
 using .MeshAgents: Node, Source, Packet
 using Distributions
 using LoopVectorization
+using SpecialFunctions
 
 export generate_positions, initialize_mesh, run, plotgrid
 
@@ -118,7 +119,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
                 node.event_start = model.tick + node.t_retx_transmit_delay + rand(node.rt_retx_random_delay)
 
                 node.n_transmit_left -= 1
-
+                node.channel = 37
                 return
             end
 
@@ -127,6 +128,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
             node.state = :scanning
             node.event_start = model.tick + 1
             node.n_transmit_left = node.n_retx_transmit_count
+            node.channel = 37
         end
     end
 end
@@ -162,7 +164,9 @@ function calc_rssi!(agents::Array{Union{Node, Source}, 1}, P_tx::Array{Float64, 
         end
 
         for j in (i + 1):n
-            L_p[i, j] = log(10, max(distance(agents[i].pos, agents[j].pos), 1e-9))
+            # max(x, 1) - since if x < 1, then L_p < 0 what is wrong
+            #(probably in the future just change coordinates quantity from meters to sm/dm)
+            L_p[i, j] = log(10, max(distance(agents[i].pos, agents[j].pos), 1))
         end
     end
 
@@ -182,7 +186,7 @@ function recalc_sources_rssi!(agents::Array{Union{Node, Source}, 1}, sources::Ar
     n = length(agents)
 
     for i in sources
-        Lps = vmap!(view(agents, 1:n), x -> (log(10, max(distance(agents[i].pos, x.pos), 1e-9))))
+        Lps = vmap!(view(agents, 1:n), x -> (log(10, max(distance(agents[i].pos, x.pos), 1))))
 
         @avx for j in 1:n
             Lps[j] = 20 * Lps[j] + part_of_path_loss_for_37
@@ -200,11 +204,15 @@ function recalc_sources_rssi!(agents::Array{Union{Node, Source}, 1}, sources::Ar
     rssi_map
 end
 
+
 function model_step!(model::AgentBasedModel)
     all_agents = collect(allagents(model))
-    n = length(all_agents)
-    scanners = [i for i in 1:n if all_agents[i].state == :scanning]
-    transmitters = [i for i in 1:n if all_agents[i].transmitting]
+
+    transmitters = [
+            [a.transmitting && a.channel == 37 for a in all_agents],
+            [a.transmitting && a.channel == 38 for a in all_agents],
+            [a.transmitting && a.channel == 39 for a in all_agents]
+    ]
 
     recalc_sources_rssi!(all_agents, model.source_nodes, model.rssi_map, model.tx_powers)
 
@@ -212,52 +220,66 @@ function model_step!(model::AgentBasedModel)
     shadow_d = model.shadow_d
     multipath_d = model.multipath_d
     msg_bit_length = model.msg_bit_length
+    scanner_sensitivity = model.scanner_sensitivity
 
-    for scanner_i in scanners
+    for (agent_i, agent) in enumerate(all_agents)
         # since we support just 1 message within scanning period
-        all_agents[scanner_i].packet == nothing || continue
+        (agent.state == :scanning && agent.packet == nothing) || continue
 
-        neighbours_i = [i for i in transmitters if (model.tx_powers[i] > model.scanner_sensitivity && all_agents[i].channel == all_agents[scanner_i].channel)]
+        neighbours = model.rssi_map[agent_i, transmitters[agent.channel - 36]]
+        neighbours_agents = all_agents[transmitters[agent.channel - 36]]
+        length(neighbours) > 0 || continue
 
-        length(neighbours_i) > 0 || continue
-
-        neighbours = model.rssi_map[scanner_i, neighbours_i]
-
-        n_n = length(neighbours)
-
-        total = Float64(1e-10)
         # add random noises to calculate RSSI
-        @avx for i in 1:n_n
+        @avx for i in 1:length(neighbours)
             neighbours[i] -= rand(shadow_d) + rand(multipath_d)
+        end
+
+        visible_mask = [rssi > model.scanner_sensitivity for rssi in neighbours]
+        neighbours = neighbours[visible_mask]
+        neighbours_agents = neighbours_agents[visible_mask]
+
+        length(neighbours) > 0 || continue
+
+        # Rescaling - min-max normalization
+        # (simplified since lately division by (max - min) shrink in SINR))
+        # + calculating total
+        total = 1e-8
+        @avx for i in 1:length(neighbours)
+            neighbours[i] -= scanner_sensitivity
             total += neighbours[i]
         end
 
-        total += rand(model.wifi_noise_d) + rand(model.gaussian_noise)
+        # add some noises
+        wifi_noise = rand(model.wifi_noise_d) - model.scanner_sensitivity
+        gaussian_noise = rand(model.gaussian_noise) - model.scanner_sensitivity
+        total += max(wifi_noise, 0) + max(gaussian_noise, 0)
 
         # calculate SINR and take sqrt
-        @avx for i in 1:n_n
-            neighbours[i] = sqrt(neighbours[i] / (total - neighbours[i]))
+        @avx for i in 1:length(neighbours)
+            neighbours[i] = neighbours[i] / (total - neighbours[i])
         end
 
         # calculate BER
-        #println(neighbours)
-        neighbours = cdf.(Standard_Normal_d, neighbours)
+        neighbours = map(n -> 0.5 * erfc(sqrt(n / 2)), neighbours)
+
 
         # calculate PAR (Package Accept Rate) (PAR = 1 - PER)
-        total_PAR = Float64(0.0)
-        @avx for i in 1:n_n
+        @avx for i in 1:length(neighbours)
             neighbours[i] = (1 - neighbours[i]) ^ msg_bit_length
-            total_PAR += neighbours[i]
         end
 
-        if rand() <= total_PAR  # then we will receive message
-            tx_i = StatsBase.sample(neighbours_i, Weights(neighbours))
-            all_agents[scanner_i].packet = deepcopy(all_agents[tx_i].packet)
-        end
+        total_PAR = sum(neighbours)
+
+        rand() <= total_PAR || continue # then we will receive message
+
+        tx_i = StatsBase.sample(1:length(neighbours), Weights(neighbours))
+        agent.packet = deepcopy(neighbours_agents[tx_i].packet)
     end
 
     model.tick += 1
 end
+
 
 function plotgrid(model::AgentBasedModel)
     g = SimpleGraph(nagents(model))
