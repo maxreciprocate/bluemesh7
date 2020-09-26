@@ -4,14 +4,17 @@ using LightGraphs, GraphPlot
 using Random
 using DataStructures: CircularBuffer
 
-export generate_graph, initialize_mesh, run, plotgraph, plotgrid
+export generate_graph, initialize_mesh, run, plotgraph, start
 
 mutable struct Packet
-    seq::Int
-    src::UInt16
-    dst::UInt16
-    last::UInt16
-    ttl::UInt8
+    seq :: Int
+    src :: UInt16
+    dst :: UInt16
+    ttl :: UInt8
+
+    time_start :: Int
+    time_done :: Int
+    done :: Bool
 end
 
 Base.@kwdef mutable struct Node <: AbstractAgent
@@ -30,7 +33,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     state :: Symbol = :scanning
 
     # the time of the event's (current state) begging
-    event_start :: Int = rand(0:10)
+    event_start :: Int = rand(0:50)
 
     # whether the device is currently sending data (this removes the need for redundant allocations)
     transmitting :: Bool = false
@@ -48,7 +51,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     t_back_off_delay :: UInt = 5
 
     # the number of extra retransmissions of the received packet
-    n_retx_transmit_count :: UInt = 1
+    n_retx_transmit_count :: UInt = 0
 
     # the length of the delay between bonus transmissions of the received packet (ms)
     t_retx_transmit_delay :: UInt = 20
@@ -62,8 +65,11 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     # buffer containing seq of the received packets
     received_packets :: CircularBuffer{Int} = CircularBuffer{Int}(20)
 
-    # the current advertisement
-    packet :: Union{Packet, Nothing} = nothing
+    # the reference to the current holding packet
+    packet_seq :: Int = 0
+
+    # own ttl for the current packet
+    packet_ttl :: UInt8 = 0
 end
 
 Base.@kwdef mutable struct Source <: AbstractAgent
@@ -92,7 +98,8 @@ Base.@kwdef mutable struct Source <: AbstractAgent
     # the current number of extra transmissions left
     n_transmit_left :: UInt = 0
 
-    packet :: Union{Packet, Nothing} = nothing
+    packet_seq :: Int = 0
+    packet_ttl :: Int = 0
 end
 
 function agent_step!(source::Source, model::AgentBasedModel)
@@ -100,15 +107,17 @@ function agent_step!(source::Source, model::AgentBasedModel)
         # move off to a random position
         move_agent!(source, model)
 
-        source.packet = Packet(model.tick, source.id, rand(1:nagents(model)-1), source.id, model.ttl)
-        source.event_start = model.tick
+        # generate next packet
+        source.packet_seq = length(model.packets) + 1
+        source.packet_ttl = model.ttl
+        packet = Packet(source.packet_seq, source.id, rand(1:nagents(model)-1), model.ttl, model.tick, 0, false)
+        push!(model.packets, packet)
+        model.packet_xs[packet.seq] = Int[]
 
-        model.travelling_packets[source.packet.seq] = Int[]
-        # @show source.packet.seq, source.packet.dst
-        model.produced += 1
+        source.event_start = model.tick
     end
 
-    source.packet === nothing && return
+    source.packet_seq == 0 && return
     model.tick < source.event_start && return
 
     d, r = divrem(model.tick - source.event_start, source.t_interpdu)
@@ -119,10 +128,12 @@ function agent_step!(source::Source, model::AgentBasedModel)
         if source.n_transmit_left > 0
             source.event_start = model.tick + source.t_og_transmit_delay + rand(source.rt_og_random_delay)
             source.n_transmit_left -= 1
+
             return
         end
 
-        source.packet = nothing
+        # back to resting
+        source.packet_seq = 0
         source.transmitting = false
         source.n_transmit_left = source.n_og_transmit_count
     end
@@ -133,49 +144,44 @@ function agent_step!(node::Node, model::AgentBasedModel)
         # scanning happens every tick (assuming here scan_window == scan_interval)
         node.channel = div(abs(model.tick - node.event_start), node.t_scan_interval) + 37
 
-        # no packets acquired, repeat
+        # no packets acquired, repeat scanning
         if node.channel > 39
             node.channel = 37
             node.event_start = model.tick
         end
 
-        # instead of type instability here, zero(Packet) might work
-        node.packet === nothing && return
+        node.packet_seq == 0 && return
 
-        if node.packet.seq in node.received_packets
-            node.packet = nothing
-
+        # we've seen this seq recently
+        if node.packet_seq in node.received_packets
+            node.packet_seq = 0
             return
         end
 
-        push!(node.received_packets, node.packet.seq)
+        push!(node.received_packets, node.packet_seq)
 
-        # already delivered
-        if node.packet.dst == node.id
-            node.packet = nothing
+        packet = model.packets[node.packet_seq]
+
+        # the delivery is processed in model_step!, here's just for completness
+        if packet.dst == node.id
+            node.packet_seq = 0
+            println("this never?")
             return
         end
 
-        if node.packet.ttl == 0
-            node.packet = nothing
-
+        if node.packet_ttl == 1
+            node.packet_seq = 0
             return
         end
 
-        # registering the touch upon this yet not delivered packet
-        seq = node.packet.seq
-        if haskey(model.travelling_packets, seq)
-            # println("$(node.id) registering $(seq)")
-            push!(model.travelling_packets[seq], node.id)
-        end
 
-        node.packet.ttl -= 1
+
+        node.packet_ttl -= 1
 
         if node.role == :relay
             # initiating back-off delay before advertising this packet
             node.event_start = model.tick + node.t_back_off_delay
             node.state = :advertising
-
             return
         end
     end
@@ -186,10 +192,9 @@ function agent_step!(node::Node, model::AgentBasedModel)
         model.tick < node.event_start && return
 
         # return to scanning if the packet is absent
-        if node.packet === nothing
+        if node.packet_seq == 0
             node.state = :scanning
             node.event_start = model.tick
-
             return
         end
 
@@ -210,11 +215,10 @@ function agent_step!(node::Node, model::AgentBasedModel)
                 node.event_start = model.tick + node.t_retx_transmit_delay + rand(node.rt_retx_random_delay)
 
                 node.n_transmit_left -= 1
-
                 return
             end
 
-            node.packet = nothing
+            node.packet_seq = 0
             node.transmitting = false
             node.state = :scanning
             node.event_start = model.tick + 1
@@ -239,23 +243,29 @@ function model_step!(model::AgentBasedModel)
 
         rand() < model.packet_error_rate && continue
 
-        packet = first(neighbours).packet
-        # marking the packet as delivered before the actor himself has even noticed
-        if dst.id == packet.dst && haskey(model.travelling_packets, packet.seq)
-            append!(model.reward_plate, model.travelling_packets[packet.seq])
-            delete!(model.travelling_packets, packet.seq)
+        packet = model.packets[first(neighbours).packet_seq]
 
-            model.received += 1
+        packet.done && continue
+        # registering the touch upon this yet not delivered packet
+        push!(model.packet_xs[packet.seq], dst.id)
+
+        # this is mainly for the pomdp interface
+        if packet.dst == dst.id
+            # since the packet is delivered, acknowledge everyone participating
+            append!(model.reward_plate, model.packet_xs[packet.seq])
         end
 
-        dst.packet = deepcopy(first(neighbours).packet)
-        dst.packet.last = first(neighbours).id
-    end
+        # marking the packet as delivered
+        if packet.dst == dst.id
+            packet.done = true
+            packet.time_done = model.tick
 
-    for seq in keys(model.travelling_packets)
-        if model.tick - seq > 300
-            delete!(model.travelling_packets, seq)
+            continue
         end
+
+        # copying packet's reference
+        dst.packet_seq = packet.seq
+        dst.packet_ttl = first(neighbours).packet_ttl
     end
 
     model.tick += 1
@@ -314,17 +324,16 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     properties = Dict(
         :tick => 0,
         :packet_error_rate => 0.05,
-        :packet_emit_rate => 5 / 1000,
+        :packet_emit_rate => 10 / 1000,
         :ttl => 4,
-        :received => 0,
-        :produced => 0,
-        # packet.seq => nodes that touched that packet
-        :travelling_packets => Dict{Int, Vector{Int}}(),
+        :packets => Packet[],
+        # packet.seq => nodes that have touched that packet
+        :packet_xs => Dict{Int, Vector{Int}}(),
         # plate for the actors who contributed to packet's successful delivery
         :reward_plate => Int[]
     )
 
-    space = GridSpace((maximum(first.(positions)), maximum(last.(positions))), moore = true)
+    space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
     model = ABM(Union{Source, Node}, space; properties, warn = false)
 
     for (pos, roles_i) in zip(positions, roles)
@@ -348,6 +357,17 @@ function start(model::AgentBasedModel; minutes = 1)
 
     _, dfm = run!(model, agent_step!, model_step!, steps)
 
-    model.produced - count(kv -> isempty(last(kv)), mesh.travelling_packets), model.received
+    # filter packets which were too recently produced, or produced in an unreachable position
+    filter!(packet -> packet.time_start < steps - 5000 && !isempty(model.packet_xs[packet.seq]), model.packets)
+
+    # worst case in terms of PDR to a single device
+    worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)-1))
+    deprived = filter(p -> p.dst == worstnode, model.packets)
+    delivered = filter(p -> p.done == true, model.packets)
+    delays = map(p -> p.time_done - p.time_start, delivered)
+
+    return ( PDR = length(delivered) / length(model.packets),
+             worstPDR = count(p -> p.done == false, deprived) / length(deprived),
+             delay = sum(delays) / length(delays) )
 end
 end
