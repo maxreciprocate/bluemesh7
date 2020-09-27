@@ -269,6 +269,28 @@ function plotgrid(model::AgentBasedModel)
     gplot(g, xs, ys; nodefillc = cs)
 end
 
+function plotgraph(model::AgentBasedModel)
+    g = SimpleGraph(nagents(model))
+
+    for (src_i, src) in enumerate(allagents(model)), (dst_i, dst) in enumerate(allagents(model))
+        src.role == :relay || continue
+        dst.role != :source || continue
+
+        if model.rssi_map[src_i, dst_i] * mean(model.multipath_d) * mean(model.shadow_d) > model.scanner_sensitivity
+            add_edge!(g, src.id, dst.id)
+        end
+    end
+
+    colors = Dict(:relay => "orange", :sink => "darkblue", :source => "transparent")
+
+    agents = sort(collect(allagents(model)), by=a -> a.id)
+    xs = map(a -> a.pos[1], agents)
+    ys = map(a -> a.pos[2], agents)
+    cs = map(a -> colors[a.role], agents)
+
+    gplot(g, xs, ys; nodefillc = cs)
+end
+
 """
     generate_positions(; dims = (200, 200), n_nodes = 100) → positions::Array{Tuple{Int,Int},1}
 
