@@ -1,17 +1,13 @@
-module MeshAgents
-
-using Agents
-using DataStructures: CircularBuffer
-
-export Node, Source, Packet
-
 mutable struct Packet
-    seq::Int
-    src::UInt16
-    dst::UInt16
-    ttl::UInt8
-end
+    seq :: Int
+    src :: UInt16
+    dst :: UInt16
+    ttl :: UInt8
 
+    time_start :: Int
+    time_done :: Int
+    done :: Bool
+end
 
 Base.@kwdef mutable struct Node <: AbstractAgent
     id::Int
@@ -29,13 +25,13 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     state :: Symbol = :scanning
 
     # the time of the event's (current state) begging
-    event_start :: UInt = 0
+    event_start :: Int = rand(0:50)
 
     # whether the device is currently sending data (this removes the need for redundant allocations)
     transmitting :: Bool = false
 
     # the length of the interval between transmissions on different channels (ms)
-    t_interpdu :: UInt = 5
+    t_interpdu :: UInt = 1
 
     # the length of the interval between scanning on different channels (ms)
     t_scan_interval :: UInt = 20
@@ -58,11 +54,14 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     # buffer containing seq of the received packets
     received_packets :: CircularBuffer{Int} = CircularBuffer{Int}(20)
 
-    # the current advertisement
-    packet :: Union{Packet, Nothing} = nothing
-
-    # the power of the transmission
+    # transmitting power
     tx_power :: Float64 = 1e-3
+
+    # the reference to the current holding packet
+    packet_seq :: Int = 0
+
+    # own ttl for the current packet
+    packet_ttl :: UInt8 = 0
 end
 
 Base.@kwdef mutable struct Source <: AbstractAgent
@@ -74,6 +73,7 @@ Base.@kwdef mutable struct Source <: AbstractAgent
 
     channel :: UInt8 = 37
     event_start :: UInt = 0
+    dBm :: Int = 4
     transmitting :: Bool = false
 
     t_interpdu :: UInt = 5
@@ -90,11 +90,9 @@ Base.@kwdef mutable struct Source <: AbstractAgent
     # the current number of extra transmissions left
     n_transmit_left :: UInt = 0
 
-    packet :: Union{Packet, Nothing} = nothing
-
-    # transiving power
+    # transmitting power
     tx_power :: Float64 = 1e-3
-end
 
-
+    packet_seq :: Int = 0
+    packet_ttl :: UInt8 = 0
 end
