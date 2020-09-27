@@ -205,7 +205,7 @@ function model_step!(model::AgentBasedModel)
         length(neighbours) > 0 || continue
 
         # add random noises to calculate RSSI
-        neighbours = map(n -> n * rand(model.shadow_d) * rand(model.multipath_d), neighbours)
+        neighbours = map(n -> n / to_mW(rand(model.shadow_d) + rand(model.multipath_d)), neighbours)
 
         visible_mask = [rssi > model.scanner_sensitivity for rssi in neighbours]
         neighbours = neighbours[visible_mask]
@@ -266,7 +266,7 @@ function plotgraph(model::AgentBasedModel)
         src.role == :relay || continue
         dst.role != :source || continue
 
-        if model.rssi_map[src_i, dst_i] * mean(model.multipath_d) * mean(model.shadow_d) > model.scanner_sensitivity
+        if model.rssi_map[src_i, dst_i] > model.scanner_sensitivity
             add_edge!(g, src.id, dst.id)
         end
     end
@@ -310,8 +310,8 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         :tx_powers => Vector{Float64}(undef, n),
         :scanner_sensitivity => to_mW(-95),
         :msg_bit_length => 312,
-        :shadow_d => LogNormal((to_mW(0) - to_mW(-4)) / 2 + to_mW(-4), (to_mW(0) - to_mW(-4)) / 2),
-        :multipath_d => Rayleigh(to_mW(-4)),
+        :shadow_d => LogNormal(0, 4),
+        :multipath_d => Rayleigh(4),
         :wifi_noise_d => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
         :gaussian_noise => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
         :packets => Packet[],
