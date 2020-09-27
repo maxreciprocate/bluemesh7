@@ -61,8 +61,8 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     # the current advertisement
     packet :: Union{Packet, Nothing} = nothing
 
-    # the power of the transmission (in dBm)
-    tx_power :: Float64 = -30.0
+    # the power of the transmission
+    tx_power :: Float64 = 1e-3
 end
 
 Base.@kwdef mutable struct Source <: AbstractAgent
@@ -92,8 +92,8 @@ Base.@kwdef mutable struct Source <: AbstractAgent
 
     packet :: Union{Packet, Nothing} = nothing
 
-    # transiving power (in dbm)
-    tx_power :: Float64 = -30.0
+    # transiving power
+    tx_power :: Float64 = 1e-3
 end
 
 

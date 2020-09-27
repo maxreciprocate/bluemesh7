@@ -164,40 +164,38 @@ function calc_rssi!(agents::Array{Union{Node, Source}, 1}, P_tx::Array{Float64, 
         end
 
         for j in (i + 1):n
-            # max(x, 1) - since if x < 1, then L_p < 0 what is wrong
-            #(probably in the future just change coordinates quantity from meters to sm/dm)
-            L_p[i, j] = log(10, max(distance(agents[i].pos, agents[j].pos), 1))
+            L_p[i, j] = 1 / distance(agents[i].pos, agents[j].pos) ^ 2
         end
     end
 
     @avx for i in 1:n
         for j in 1:n
-            rssi_map[i, j] = P_tx[j] - 20 * L_p[i, j] - part_of_path_loss_for_37 # dB
+            rssi_map[i, j] = P_tx[j] * L_p[i, j] * part_of_path_loss_for_37 # dB
         end
 
-        rssi_map[i, i] = -Inf
+        rssi_map[i, i] = 0
     end
 
     rssi_map
 end
 
 function recalc_sources_rssi!(agents::Array{Union{Node, Source}, 1}, sources::Array{Int, 1},
-        rssi_map::Matrix{Float64}, P_tx::Array{Float64, 1})
+        rssi_map:: Matrix{Float64}, P_tx::Array{Float64, 1})
     n = length(agents)
 
     for i in sources
-        Lps = vmap!(view(agents, 1:n), x -> (log(10, max(distance(agents[i].pos, x.pos), 1))))
+        Lps = vmap!(view(agents, 1:n), x -> 1 / distance(agents[i].pos, x.pos) ^ 2)
 
         @avx for j in 1:n
-            Lps[j] = 20 * Lps[j] + part_of_path_loss_for_37
-            rssi_map[i, j] = P_tx[j] - Lps[j] # dB
+            Lps[j] = Lps[j] * part_of_path_loss_for_37
+            rssi_map[i, j] = P_tx[j] * Lps[j] # dB
         end
 
         @avx for j in 1:n
-            rssi_map[j, i] = P_tx[i] - Lps[j] # dB
+            rssi_map[j, i] = P_tx[i] * Lps[j] # dB
         end
 
-        rssi_map[i, i] = -Inf
+        rssi_map[i, i] = 0
 
     end
 
@@ -216,12 +214,6 @@ function model_step!(model::AgentBasedModel)
 
     recalc_sources_rssi!(all_agents, model.source_nodes, model.rssi_map, model.tx_powers)
 
-    # LoopVectorization definetely not perfect
-    shadow_d = model.shadow_d
-    multipath_d = model.multipath_d
-    msg_bit_length = model.msg_bit_length
-    scanner_sensitivity = model.scanner_sensitivity
-
     for (agent_i, agent) in enumerate(all_agents)
         # since we support just 1 message within scanning period
         (agent.state == :scanning && agent.packet == nothing) || continue
@@ -231,9 +223,7 @@ function model_step!(model::AgentBasedModel)
         length(neighbours) > 0 || continue
 
         # add random noises to calculate RSSI
-        @avx for i in 1:length(neighbours)
-            neighbours[i] -= rand(shadow_d) + rand(multipath_d)
-        end
+        neighbours = map(n -> n * rand(model.shadow_d) * rand(model.multipath_d), neighbours)
 
         visible_mask = [rssi > model.scanner_sensitivity for rssi in neighbours]
         neighbours = neighbours[visible_mask]
@@ -241,33 +231,18 @@ function model_step!(model::AgentBasedModel)
 
         length(neighbours) > 0 || continue
 
-        # Rescaling - min-max normalization
-        # (simplified since lately division by (max - min) shrink in SINR))
-        # + calculating total
-        total = 1e-8
-        @avx for i in 1:length(neighbours)
-            neighbours[i] -= scanner_sensitivity
-            total += neighbours[i]
-        end
-
         # add some noises
-        wifi_noise = rand(model.wifi_noise_d) - model.scanner_sensitivity
-        gaussian_noise = rand(model.gaussian_noise) - model.scanner_sensitivity
-        total += max(wifi_noise, 0) + max(gaussian_noise, 0)
+        total = sum(neighbours) + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+        #println("RSSI", neighbours, total)
 
         # calculate SINR and take sqrt
-        @avx for i in 1:length(neighbours)
-            neighbours[i] = neighbours[i] / (total - neighbours[i])
-        end
+        neighbours = map(n -> n / (total - n), neighbours)
 
         # calculate BER
         neighbours = map(n -> 0.5 * erfc(sqrt(n / 2)), neighbours)
 
-
         # calculate PAR (Package Accept Rate) (PAR = 1 - PER)
-        @avx for i in 1:length(neighbours)
-            neighbours[i] = (1 - neighbours[i]) ^ msg_bit_length
-        end
+        neighbours = map(n -> (1 - n)^model.msg_bit_length, neighbours)
 
         total_PAR = sum(neighbours)
 
@@ -306,6 +281,7 @@ generate_positions(; dims = (100, 100), n_nodes = 64) = [(rand(1:dims[1]), rand(
 
 Create a mesh by specifying roles of each node by `roles`=[0, 1, 0...] where 1 means that the node is a relay, sink otherwise, and including `positions`=[(Int, Int)...] as nodes' positions
 """
+to_mW(dBm::Int64) = 10^(dBm / 10)
 function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     length(roles) == length(positions) || throw(ArgumentError("Both arguments must be of equal length"))
 
@@ -320,11 +296,11 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         :rssi_map               => Matrix{Float64}(undef, 0, 0),
         :source_nodes           => Array{Int64, 1}(),
         :tx_powers              => Array{Float64, 1}(undef, length(roles)),
-        :scanner_sensitivity    => -95, # db
-        :shadow_d               => LogNormal(0, 4),
-        :multipath_d            => Rayleigh(4),
-        :wifi_noise_d           => Normal(-70, 20),
-        :gaussian_noise         => Normal(-90, 5)
+        :scanner_sensitivity    => to_mW(-95),
+        :shadow_d               => LogNormal((to_mW(0) - to_mW(-4)) / 2 + to_mW(-4), (to_mW(0) - to_mW(-4)) / 2),
+        :multipath_d            => Rayleigh(to_mW(-4)),
+        :wifi_noise_d           => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
+        :gaussian_noise         => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2)
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))), moore = true)
@@ -345,6 +321,7 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
 
     model.rssi_map = calc_rssi!(collect(allagents(model)), model.tx_powers)
 
+    #println("model.rssi_map: ", model.rssi_map)
     model
 end
 
