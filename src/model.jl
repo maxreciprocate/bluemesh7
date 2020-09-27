@@ -328,12 +328,13 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     model.tx_powers[1] = source.tx_power
     add_agent_single!(source, model)
 
-    for (pos, roles_i) in zip(positions, roles)
-        node = Node(id = nextid(model); pos, role = roles_i == 1 ? :relay : :sink)
+    for i in 1:length(roles)
+        node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
 
         model.tx_powers[node.id] = node.tx_power
+        model.tx_powers[i + 1] = node.tx_power
     end
 
     model.rssi_map = calc_rssi!(collect(allagents(model)), model.tx_powers)
