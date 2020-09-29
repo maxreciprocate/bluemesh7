@@ -73,12 +73,11 @@ Base.@kwdef mutable struct Source <: AbstractAgent
 
     channel :: UInt8 = 37
     event_start :: UInt = 0
-    dBm :: Int = 4
     transmitting :: Bool = false
 
-    t_interpdu :: UInt = 5
+    t_interpdu :: UInt = 10
 
-    # the number of extra transmissions of the packet originating from the node
+    # the number of extra transmissions for a packet originating from the source
     n_og_transmit_count :: UInt = 2
 
     # the length of the delay between additional transmissions of the original packet (ms)

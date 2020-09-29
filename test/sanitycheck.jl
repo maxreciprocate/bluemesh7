@@ -1,5 +1,5 @@
 include("../src/BlueMesh7.jl")
-using .BlueMesh7
+# ■
 
 using Random
 using DataFrames
@@ -12,16 +12,17 @@ benchmark = DataFrame()
 minutes = 7
 ngraphs = 7
 
-n_nodes = [32, 64, 128]
-dims = [(100, 100), (121, 121), (144, 144)]
+benchmark
+nactors = [32, 64, 96]
+dims = [(10, 10), (20, 20), (30, 30), (40, 40)]
 
-setups = [(d, n) for d in dims, n in n_nodes] |> vec
+setups = [(d, n) for d in dims, n in nactors] |> vec
 results = DataFrame()
 
 Random.seed!(7)
-allgraphs = [generate_graph(; n_nodes = n, dims = d) for _ = 1:ngraphs, (d, n) in setups]
+allgraphs = [generate_positions(; n, dims) for _ = 1:ngraphs, (dims, n) in setups]
 
-function bench(name; init, unroll)
+function bench(name, benchmark; init, unroll)
     println("Benching $(name)")
     bench_stats = DataFrame()
 
@@ -36,14 +37,14 @@ function bench(name; init, unroll)
             unlock(spin)
 
             Random.seed!(7)
-            stats = unroll(mesh, minutes)
+            stats = unroll(mesh, setup, minutes)
 
             push!(setup_stats, stats)
         end
 
         @assert nrow(setup_stats) == ngraphs
         averages = [setup, colwise(mean, setup_stats)...]
-        push!(bench_stats, NamedTuple{(:setup, :pdr, :worstpdr, :delay)}(averages))
+        push!(bench_stats, NamedTuple{(:setup, :pdr, :worstpdr, :delay, :centrality, :packetloss)}(averages))
     end
 
     bench_stats.algorithm = name
@@ -52,86 +53,99 @@ function bench(name; init, unroll)
         push!(benchmark, row)
     end
 end
+
+bench("All relays", benchmark,
+      init = coordinates -> initialize_mesh(coordinates, ones(Int, length(coordinates))),
+      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+
+bench("Half relays", benchmark,
+      init = coordinates -> initialize_mesh(coordinates, rand(0:1, length(coordinates))),
+      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+
 # ■
-
-bench("All relays",
-      init = (graph) -> initialize_mesh(first(graph), ones(Int, length(first(graph)))),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
-
-bench("Half relays",
-      init = (graph) -> initialize_mesh(first(graph), rand(0:1, length(first(graph)))),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
 
 using PyCall
 pushfirst!(PyVector(pyimport("sys")."path"), "../test/ble-mesh-algorithms/standard-algorithms/")
 greedy = pyimport("greedy_algorithms")
 dominator = pyimport("dominator_algorithm")
 
-bench("Connect",
-      init = (graph) -> initialize_mesh(first(graph), greedy.greedy_connect(last(graph))),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
+function init_rssi_to_adjacency(coordinates::Vector{NTuple{2, Int}}, Oracle)
+    protomesh = initialize_mesh(coordinates, ones(Int, length(coordinates)))
+    mask = protomesh.rssi_map .> protomesh.scanner_sensitivity + 1e-10
 
-bench("Dominator",
-      init = (graph) -> initialize_mesh(first(graph), dominator.dominator(last(graph))),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
+    adjacency = zeros(Int, size(protomesh.rssi_map))
+    adjacency[mask] .= 1
+    adjacency = adjacency[2:end, 2:end]
 
-# ■
+    roles = Oracle(adjacency)
+    initialize_mesh(coordinates, roles)
+end
 
-@load "../src/Q-LAVISH.bson" Q
+bench("Connect", benchmark,
+      init = coordinates -> init_rssi_to_adjacency(coordinates, greedy.greedy_connect),
+      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
 
-function unroll_pomdp(env, minutes)
+bench("Dominator", benchmark,
+      init = coordinates -> init_rssi_to_adjacency(coordinates, dominator.dominator),
+      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+
+@load "../src/MC-EXP.bson" Q
+
+tilings = [0, 1, 2, 3, [4 * idx for idx = 1:24]...] |> reverse
+function tile(nbours::Int)
+    for idx in 1:length(tilings)
+        if tilings[idx] <= nbours
+            return idx
+        end
+    end
+end
+
+function unroll_mc(env, setup, minutes)
     na = length(env.positions)
     moves = zeros(Int, na)
+    dim = (setup[1][1] - 10) ÷ 10
+
+    for a in 1:na
+        nbours, _ = get_state(env, a)
+
+        moves[a] = argmax(Q[:, tile(nbours), dim])
+    end
+
+    for t = 1:minutes * 60_000
+        env(moves, true)
+    end
+
+    getstats(env.mesh)
+end
+
+bench("Monte Carlo", benchmark,
+      init = (positions) -> BlueMesh7Env(positions),
+      unroll = unroll_mc)
+
+@load "../src/Q-MEGA.bson" Q
+
+function unroll_pomdp(env, setup, minutes)
+    na = length(env.positions)
+    moves = zeros(Int, na)
+    dim = (setup[1][1] - 10) ÷ 10
 
     for t = 1:minutes * 60_000
         for a in 1:na
             nbours, haspacket = get_state(env, a)
 
-            moves[a] = argmax(Q[:, haspacket, nbours])
+            moves[a] = argmax(Q[:, nbours, haspacket])
         end
 
         env(moves)
     end
 
-    BlueMesh7.getstats(env.mesh)
+    getstats(env.mesh)
 end
 
-bench("Tabular Q",
-      init = (graph) -> BlueMesh7Env(graph...),
+bench("TD(0)", benchmark,
+      init = (positions) -> BlueMesh7Env(positions),
       unroll = unroll_pomdp)
 
-# ■
-
 using Dates
-datenow = Dates.now()
+datenow = Date(now())
 @save "benchmark-$(datenow).bson" benchmark
-
-# ■
-using Gadfly
-using Cairo, Compose
-
-set_default_plot_size(21cm, 16cm)
-
-benchmark.ssetup = repr.(benchmark.setup)
-p = plot(benchmark,
-     x=:ssetup, y=:worstpdr, color=:algorithm, Geom.point, Geom.line,
-     # Guide.yticks(ticks=0.3:0.1:1),
-     Guide.title("The worst PDR out of 7 rollouts"),
-     Guide.xlabel("Setup (#nodes, meters squared)"),
-     Guide.ylabel("worst packet delivery ratio"),
-     Theme(
-         # minor_label_font="Fira Code",
-         # minor_label_font_size=11px,
-         # minor_label_color="black",
-         major_label_font="Fira Code",
-         major_label_font_size=18px,
-         # major_label_color="dark grey",
-         key_label_font="Fira Code",
-         key_label_font_size=13px,
-         # major_label_color="dark grey",
-         key_title_font="Fira Code",
-         key_title_font_size=16px,
-         # major_label_color="dark grey",
-     ))
-
-draw(SVG("benchmark-$(datenow).svg", 21cm, 16cm), p)
