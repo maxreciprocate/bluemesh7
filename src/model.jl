@@ -92,16 +92,6 @@ function agent_step!(node::Node, model::AgentBasedModel)
         end
 
         d, r = divrem(abs(model.tick - node.event_start), node.t_interpdu)
-        # ??? Q switches related perhaps
-        if d > 5
-            node.packet_seq = 0
-            node.transmitting = false
-            node.state = :scanning
-            node.event_start = model.tick + 1
-            node.n_transmit_left = node.n_retx_transmit_count
-            node.channel = 37
-            return
-        end
 
         # transmitting happens once for each channel
         node.transmitting = iszero(r)
@@ -129,15 +119,8 @@ function agent_step!(node::Node, model::AgentBasedModel)
     end
 end
 
-distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2)
-
-function xvmap!(arr::SubArray, func::Function, arr2::SubArray)
-    length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
-    @avx for i in 1:length(arr)
-        arr2[i] = func(arr[i])
-    end
-    arr2
-end
+# without sqrt, and taking into account overlapping devices
+distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = (a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 + 1e-3
 
 function xvmap!(arr::SubArray, func::Function)
     length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
@@ -160,7 +143,7 @@ function calc_rssi!(agents::Vector{Union{Node, Source}}, P_tx::Vector{Float64})
         end
 
         for j in (i + 1):n
-            L_p[i, j] = 1 / distance(agents[i].pos, agents[j].pos) ^ 2
+            L_p[i, j] = 1 / distance(agents[i].pos, agents[j].pos)
         end
     end
 
@@ -179,7 +162,7 @@ function recalc_sources_rssi!(agents::Vector{Union{Node, Source}}, rssi_map:: Ma
     n = length(agents)
 
     source_i = 1
-    Lps = xvmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos) ^ 2)
+    Lps = xvmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos))
 
     @avx for j in 1:n
         Lps[j] = Lps[j] * part_of_path_loss_for_37
@@ -192,7 +175,7 @@ function recalc_sources_rssi!(agents::Vector{Union{Node, Source}}, rssi_map:: Ma
 
     rssi_map[source_i, source_i] = 0
 
-    rssi_map
+    nothing
 end
 
 function model_step!(model::AgentBasedModel)
@@ -210,35 +193,39 @@ function model_step!(model::AgentBasedModel)
     recalc_sources_rssi!(all_agents, model.rssi_map, model.tx_powers)
 
     for (dst_i, dst) in enumerate(all_agents)
-        # since we support just 1 message within scanning period
         (dst.state == :scanning && dst.packet_seq == 0) || continue
 
-        all_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
+        rssi_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
         neighbours_agents = all_agents[transmitters[dst.channel - 36]]
-        length(all_neighbours) > 0 || continue
 
-        # add random noises to calculate RSSI
-        all_neighbours = map(n -> n / to_mW(rand(model.shadow_d) + rand(model.multipath_d)), all_neighbours)
+        isempty(rssi_neighbours) && continue
 
-        visible_mask = [rssi > model.scanner_sensitivity for rssi in all_neighbours]
-        neighbours = all_neighbours[visible_mask]
+        # FIXME
+        # # add shadow and multipath fading
+        # for idx in eachindex(rssi_neighbours)
+        #     rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
+        # end
+
+        # register background noise
+        total = sum(rssi_neighbours) # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+
+        # filter unreachable sources
+        visible_mask = [rssi > model.scanner_sensitivity for rssi in rssi_neighbours]
+        rssi_neighbours = rssi_neighbours[visible_mask]
         neighbours_agents = neighbours_agents[visible_mask]
 
-        length(neighbours) > 0 || continue
+        isempty(rssi_neighbours) && continue
 
-        # add some noises
-        total = sum(all_neighbours) + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+        message_length = model.msg_bit_length
 
-        # calculate SINR and take sqrt
-        neighbours = map(n -> n / (total - n), neighbours)
+        # after this step rssi_neighbours become par_neighbours
+        for (idx, rssi) in enumerate(rssi_neighbours)
+            SINR = rssi / (total - rssi)
+            BER = 0.5 * erfc(sqrt(SINR / 2))
+            rssi_neighbours[idx] = (1 - BER)^message_length
+        end
 
-        # calculate BER
-        neighbours = map(n -> 0.5 * erfc(sqrt(n / 2)), neighbours)
-
-        # calculate PAR (Package Accept Rate) (PAR = 1 - PER)
-        neighbours = map(n -> (1 - n)^model.msg_bit_length, neighbours)
-
-        total_PAR = sum(neighbours)
+        total_PAR = sum(rssi_neighbours)
 
         # do any of this packets pass?
         if rand() > total_PAR
@@ -246,7 +233,7 @@ function model_step!(model::AgentBasedModel)
             continue
         end
 
-        src_i = sample(1:length(neighbours), Weights(neighbours))
+        src_i = sample(1:length(rssi_neighbours), Weights(rssi_neighbours))
         packet = model.packets[neighbours_agents[src_i].packet_seq]
 
         packet.done && continue
@@ -319,9 +306,9 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
 
     properties = Dict(
         :tick => 0,
-        :packet_emit_rate => 10 / 1000,
+        :packet_emit_rate => 20 / 1000,
         :packets_lost => 0,
-        :ttl => 4,
+        :ttl => 5,
         :rssi_map => Matrix{Float64}(undef, n, n),
         :tx_powers => Vector{Float64}(undef, n),
         :scanner_sensitivity => to_mW(-95),
@@ -359,7 +346,7 @@ end
 
 function getstats(model::AgentBasedModel)
     # filter packets which were too recently produced, or produced in an unreachable position
-    filter!(packet -> packet.time_start < model.tick - 5000 && !isempty(model.packet_xs[packet.seq]), model.packets)
+    filter!(packet -> packet.time_start < model.tick - 1000 && !isempty(model.packet_xs[packet.seq]), model.packets)
 
     # worst case in terms of PDR to a single device
     worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)-1))

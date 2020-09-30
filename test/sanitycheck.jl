@@ -9,12 +9,11 @@ using BSON: @load, @save
 # ■
 
 benchmark = DataFrame()
-minutes = 7
+minutes = 2
 ngraphs = 7
 
-benchmark
-nactors = [32, 64, 96]
-dims = [(10, 10), (20, 20), (30, 30), (40, 40)]
+nactors = [16, 32, 64, 96]
+dims = [(20, 20), (30, 30)]
 
 setups = [(d, n) for d in dims, n in nactors] |> vec
 results = DataFrame()
@@ -61,7 +60,6 @@ bench("All relays", benchmark,
 bench("Half relays", benchmark,
       init = coordinates -> initialize_mesh(coordinates, rand(0:1, length(coordinates))),
       unroll = (mesh, setup, minutes) -> start(mesh; minutes))
-
 # ■
 
 using PyCall
@@ -88,8 +86,9 @@ bench("Connect", benchmark,
 bench("Dominator", benchmark,
       init = coordinates -> init_rssi_to_adjacency(coordinates, dominator.dominator),
       unroll = (mesh, setup, minutes) -> start(mesh; minutes))
-
-@load "../src/MC-EXP.bson" Q
+# ■
+# @load "../src/10.4-ground-bench.bson" benchmark
+@load "../solving/MC-EXP.bson" Q
 
 tilings = [0, 1, 2, 3, [4 * idx for idx = 1:24]...] |> reverse
 function tile(nbours::Int)
@@ -103,13 +102,15 @@ end
 function unroll_mc(env, setup, minutes)
     na = length(env.positions)
     moves = zeros(Int, na)
-    dim = (setup[1][1] - 10) ÷ 10
+    dim = setup[1][1] ÷ 10
 
     for a in 1:na
         nbours, _ = get_state(env, a)
 
         moves[a] = argmax(Q[:, tile(nbours), dim])
     end
+
+    env(moves)
 
     for t = 1:minutes * 60_000
         env(moves, true)
@@ -121,6 +122,7 @@ end
 bench("Monte Carlo", benchmark,
       init = (positions) -> BlueMesh7Env(positions),
       unroll = unroll_mc)
+# ■
 
 @load "../src/Q-MEGA.bson" Q
 

@@ -37,10 +37,10 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     t_scan_interval :: UInt = 20
 
     # the length of the interval before advertising the received packet
-    t_back_off_delay :: UInt = 5
+    t_back_off_delay :: UInt = 10
 
     # the number of extra retransmissions of the received packet
-    n_retx_transmit_count :: UInt = 0
+    n_retx_transmit_count :: UInt = 1
 
     # the length of the delay between bonus transmissions of the received packet (ms)
     t_retx_transmit_delay :: UInt = 20
@@ -75,13 +75,13 @@ Base.@kwdef mutable struct Source <: AbstractAgent
     event_start :: UInt = 0
     transmitting :: Bool = false
 
-    t_interpdu :: UInt = 10
+    t_interpdu :: UInt = 1
 
     # the number of extra transmissions for a packet originating from the source
     n_og_transmit_count :: UInt = 2
 
     # the length of the delay between additional transmissions of the original packet (ms)
-    t_og_transmit_delay :: UInt = 20
+    t_og_transmit_delay :: UInt = 10
 
     # the range of the additional random component to delay between additional original transmissions
     rt_og_random_delay :: UnitRange{Int} = 0:20

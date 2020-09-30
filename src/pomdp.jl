@@ -25,12 +25,17 @@ function BlueMesh7Env(positions::Vector{NTuple{2, Int}})
     BlueMesh7Env(positions, zeros(Float64, n), nbours, mesh)
 end
 
-function (env::BlueMesh7Env)(moves::Vector{Int})
-    for idx in eachindex(moves)
-        env.mesh[idx].role = moves[idx] == 1 ? :relay : :sink
+function (env::BlueMesh7Env)(moves::Vector{Int}, eval=false)
+    if !eval
+        for idx in eachindex(moves)
+            env.mesh[idx].role = moves[idx] == 1 ? :relay : :sink
+        end
     end
 
     step!(env.mesh, agent_step!, model_step!)
+
+    # no need for rewards if no one is going to get them
+    eval && return
 
     # calculate rewards
     fill!(env.rewards, 0.0)
@@ -42,7 +47,7 @@ function (env::BlueMesh7Env)(moves::Vector{Int})
     end
 
     for packet in env.mesh.packets
-        if packet.done || env.mesh.tick - packet.time_start > 5000
+        if packet.done || env.mesh.tick - packet.time_start > 1000
             continue
         end
 
