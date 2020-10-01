@@ -72,7 +72,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
 
         if node.role == :relay
             # initiating back-off delay before advertising this packet
-            node.event_start = model.tick + node.t_back_off_delay
+            node.event_start = model.tick + node.t_back_off_delay + rand(1:3)
             node.state = :advertising
 
             return
@@ -187,6 +187,9 @@ function model_step!(model::AgentBasedModel)
             [a.transmitting && a.channel == 39 for a in all_agents]
     ]
 
+    transmitters_count = sum(sum(transmitters))
+    count_successes = zeros(Int, nagents(model))
+
     # (pomdp): clear previous reward nominees
     empty!(model.reward_plate)
 
@@ -196,18 +199,18 @@ function model_step!(model::AgentBasedModel)
         (dst.state == :scanning && dst.packet_seq == 0) || continue
 
         rssi_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
-        neighbours_agents = all_agents[transmitters[dst.channel - 36]]
 
         isempty(rssi_neighbours) && continue
 
-        # FIXME
-        # # add shadow and multipath fading
-        # for idx in eachindex(rssi_neighbours)
-        #     rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
-        # end
+        neighbours_agents = all_agents[transmitters[dst.channel - 36]]
+
+        # add shadow and multipath fading
+        for idx in eachindex(rssi_neighbours)
+            rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
+        end
 
         # register background noise
-        total = sum(rssi_neighbours) # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+        total = sum(rssi_neighbours) + 1e-15 # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
 
         # filter unreachable sources
         visible_mask = [rssi > model.scanner_sensitivity for rssi in rssi_neighbours]
@@ -228,13 +231,13 @@ function model_step!(model::AgentBasedModel)
         total_PAR = sum(rssi_neighbours)
 
         # do any of this packets pass?
-        if rand() > total_PAR
-            model.packets_lost += length(neighbours_agents)
-            continue
-        end
+        rand() <= total_PAR || continue
 
         src_i = sample(1:length(rssi_neighbours), Weights(rssi_neighbours))
-        packet = model.packets[neighbours_agents[src_i].packet_seq]
+
+        tx_agent = neighbours_agents[src_i]
+        packet = model.packets[tx_agent.packet_seq]
+        count_successes[tx_agent.id + 1] = 1
 
         packet.done && continue
         # registering the touch upon this yet not delivered packet
@@ -259,8 +262,15 @@ function model_step!(model::AgentBasedModel)
         dst.packet_ttl = neighbours_agents[src_i].packet_ttl
     end
 
+    if transmitters_count > 0
+        model.packets_lost += transmitters_count - sum(count_successes)
+        model.transmitters_count += transmitters_count
+    end
+
+
     model.tick += 1
 end
+
 
 function plotgraph(model::AgentBasedModel)
     g = SimpleGraph(nagents(model))
@@ -313,7 +323,7 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         :tx_powers => Vector{Float64}(undef, n),
         :scanner_sensitivity => to_mW(-95),
         :msg_bit_length => 312,
-        :shadow_d => LogNormal(0, 4),
+        :shadow_d => LogNormal(0, 1),
         :multipath_d => Rayleigh(4),
         :wifi_noise_d => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
         :gaussian_noise => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
@@ -321,7 +331,8 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         # packet.seq => nodes that have touched that packet
         :packet_xs => Dict{Int, Vector{Int}}(),
         # plate for the actors who contributed to packet's successful delivery
-        :reward_plate => Int[]
+        :reward_plate => Int[],
+        :transmitters_count => 0
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
@@ -330,6 +341,8 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     source = Source(id = 0, pos = (1, 1))
     model.tx_powers[1] = source.tx_power
     add_agent_single!(source, model)
+    
+    println("source: ", source.packet_seq)
 
     for i in 1:length(roles)
         node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
@@ -371,10 +384,10 @@ function getstats(model::AgentBasedModel)
     centrality = indegree_centrality(g, normalize=false) ./ length(devices) |> mean
 
     return ( pdr = length(delivered) / length(model.packets),
-             worstpdr = count(p -> p.done == false, deprived) / length(deprived),
+             worstcpdr = count(p -> p.done == false, deprived) / length(deprived),
              delay = sum(delays) / length(delays),
              centrality = centrality,
-             packetloss = model.packets_lost / length(model.packets))
+             packetloss = model.packets_lost / model.transmitters_count)
 end
 
 """
