@@ -1,7 +1,7 @@
 export generate_positions, initialize_mesh, start, getstats, plotgraph
 
 const ble_37_channel_wavelength = 0.12491352
-const part_of_path_loss_for_37 = 20 * log(10, 4 * π / ble_37_channel_wavelength)
+const part_of_path_loss_for_37 = (ble_37_channel_wavelength / (4 * π))^2
 
 function agent_step!(source::Source, model::AgentBasedModel)
     if rand() < model.packet_emit_rate
@@ -72,7 +72,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
 
         if node.role == :relay
             # initiating back-off delay before advertising this packet
-            node.event_start = model.tick + node.t_back_off_delay
+            node.event_start = model.tick + node.t_back_off_delay + rand(1:3)
             node.state = :advertising
 
             return
@@ -87,7 +87,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
         # return to scanning if the packet is absent
         if node.packet_seq == 0
             node.state = :scanning
-            node.event_start = model.tick
+            node.event_start = model.tick + 1
             return
         end
 
@@ -119,17 +119,10 @@ function agent_step!(node::Node, model::AgentBasedModel)
     end
 end
 
-distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2)
+# without sqrt, and taking into account overlapping devices
+distance(a::Tuple{Int, Int}, b::Tuple{Int, Int}) = (a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 + 1e-3
 
-function vmap!(arr::SubArray, func::Function, arr2::SubArray)
-    length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
-    @avx for i in 1:length(arr)
-        arr2[i] = func(arr[i])
-    end
-    arr2
-end
-
-function vmap!(arr::SubArray, func::Function)
+function xvmap!(arr::SubArray, func::Function)
     length(arr) > 0 || return Array{typeof(func(arr[1])), 1}(undef, 0)
     arr2 = Array{typeof(func(arr[1])), 1}(undef, length(arr))
     @avx for i in 1:length(arr)
@@ -150,7 +143,7 @@ function calc_rssi!(agents::Vector{Union{Node, Source}}, P_tx::Vector{Float64})
         end
 
         for j in (i + 1):n
-            L_p[i, j] = 1 / distance(agents[i].pos, agents[j].pos) ^ 2
+            L_p[i, j] = 1 / distance(agents[i].pos, agents[j].pos)
         end
     end
 
@@ -169,7 +162,7 @@ function recalc_sources_rssi!(agents::Vector{Union{Node, Source}}, rssi_map:: Ma
     n = length(agents)
 
     source_i = 1
-    Lps = vmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos) ^ 2)
+    Lps = xvmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos))
 
     @avx for j in 1:n
         Lps[j] = Lps[j] * part_of_path_loss_for_37
@@ -182,7 +175,7 @@ function recalc_sources_rssi!(agents::Vector{Union{Node, Source}}, rssi_map:: Ma
 
     rssi_map[source_i, source_i] = 0
 
-    rssi_map
+    nothing
 end
 
 function model_step!(model::AgentBasedModel)
@@ -194,44 +187,57 @@ function model_step!(model::AgentBasedModel)
             [a.transmitting && a.channel == 39 for a in all_agents]
     ]
 
+    transmitters_count = sum(sum(transmitters))
+    count_successes = zeros(Int, nagents(model))
+
+    # (pomdp): clear previous reward nominees
+    empty!(model.reward_plate)
+
     recalc_sources_rssi!(all_agents, model.rssi_map, model.tx_powers)
 
     for (dst_i, dst) in enumerate(all_agents)
-        # since we support just 1 message within scanning period
         (dst.state == :scanning && dst.packet_seq == 0) || continue
 
-        neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
+        rssi_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
+
+        isempty(rssi_neighbours) && continue
+
         neighbours_agents = all_agents[transmitters[dst.channel - 36]]
-        length(neighbours) > 0 || continue
 
-        # add random noises to calculate RSSI
-        neighbours = map(n -> n / to_mW(rand(model.shadow_d) + rand(model.multipath_d)), neighbours)
+        # add shadow and multipath fading
+        for idx in eachindex(rssi_neighbours)
+            rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
+        end
 
-        visible_mask = [rssi > model.scanner_sensitivity for rssi in neighbours]
-        neighbours = neighbours[visible_mask]
+        # register background noise
+        total = sum(rssi_neighbours) + 1e-15 # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+
+        # filter unreachable sources
+        visible_mask = [rssi > model.scanner_sensitivity for rssi in rssi_neighbours]
+        rssi_neighbours = rssi_neighbours[visible_mask]
         neighbours_agents = neighbours_agents[visible_mask]
 
-        length(neighbours) > 0 || continue
+        isempty(rssi_neighbours) && continue
 
-        # add some noises
-        total = sum(neighbours) + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
+        message_length = model.msg_bit_length
 
-        # calculate SINR and take sqrt
-        neighbours = map(n -> n / (total - n), neighbours)
+        # after this step rssi_neighbours become par_neighbours
+        for (idx, rssi) in enumerate(rssi_neighbours)
+            SINR = rssi / (total - rssi)
+            BER = 0.5 * erfc(sqrt(SINR / 2))
+            rssi_neighbours[idx] = (1 - BER)^message_length
+        end
 
-        # calculate BER
-        neighbours = map(n -> 0.5 * erfc(sqrt(n / 2)), neighbours)
-
-        # calculate PAR (Package Accept Rate) (PAR = 1 - PER)
-        neighbours = map(n -> (1 - n)^model.msg_bit_length, neighbours)
-
-        total_PAR = sum(neighbours)
+        total_PAR = sum(rssi_neighbours)
 
         # do any of this packets pass?
         rand() <= total_PAR || continue
 
-        src_i = sample(1:length(neighbours), Weights(neighbours))
-        packet = model.packets[neighbours_agents[src_i].packet_seq]
+        src_i = sample(1:length(rssi_neighbours), Weights(rssi_neighbours))
+
+        tx_agent = neighbours_agents[src_i]
+        packet = model.packets[tx_agent.packet_seq]
+        count_successes[tx_agent.id + 1] = 1
 
         packet.done && continue
         # registering the touch upon this yet not delivered packet
@@ -256,8 +262,15 @@ function model_step!(model::AgentBasedModel)
         dst.packet_ttl = neighbours_agents[src_i].packet_ttl
     end
 
+    if transmitters_count > 0
+        model.packets_lost += transmitters_count - sum(count_successes)
+        model.transmitters_count += transmitters_count
+    end
+
+
     model.tick += 1
 end
+
 
 function plotgraph(model::AgentBasedModel)
     g = SimpleGraph(nagents(model))
@@ -283,7 +296,7 @@ function plotgraph(model::AgentBasedModel)
     gplot(g, xs, ys; nodefillc = cs)
 end
 
-to_mW(dBm::Int64) = 10^(dBm / 10)
+to_mW(dBm) = 10^(dBm / 10)
 
 """
     generate_positions(; dims = (200, 200), n = 100) → positions::Array{Tuple{Int,Int},1}
@@ -303,14 +316,14 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
 
     properties = Dict(
         :tick => 0,
-        :packet_error_rate => 0.05,
-        :packet_emit_rate => 1 / 1000,
-        :ttl => 4,
+        :packet_emit_rate => 20 / 1000,
+        :packets_lost => 0,
+        :ttl => 5,
         :rssi_map => Matrix{Float64}(undef, n, n),
         :tx_powers => Vector{Float64}(undef, n),
         :scanner_sensitivity => to_mW(-95),
         :msg_bit_length => 312,
-        :shadow_d => LogNormal(0, 4),
+        :shadow_d => LogNormal(0, 1),
         :multipath_d => Rayleigh(4),
         :wifi_noise_d => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
         :gaussian_noise => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
@@ -318,7 +331,8 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         # packet.seq => nodes that have touched that packet
         :packet_xs => Dict{Int, Vector{Int}}(),
         # plate for the actors who contributed to packet's successful delivery
-        :reward_plate => Int[]
+        :reward_plate => Int[],
+        :transmitters_count => 0
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
@@ -328,12 +342,13 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
     model.tx_powers[1] = source.tx_power
     add_agent_single!(source, model)
 
-    for (pos, roles_i) in zip(positions, roles)
-        node = Node(id = nextid(model); pos, role = roles_i == 1 ? :relay : :sink)
+    for i in 1:length(roles)
+        node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
 
         model.tx_powers[node.id] = node.tx_power
+        model.tx_powers[i + 1] = node.tx_power
     end
 
     model.rssi_map = calc_rssi!(collect(allagents(model)), model.tx_powers)
@@ -342,7 +357,7 @@ end
 
 function getstats(model::AgentBasedModel)
     # filter packets which were too recently produced, or produced in an unreachable position
-    filter!(packet -> packet.time_start < model.tick - 5000 && !isempty(model.packet_xs[packet.seq]), model.packets)
+    filter!(packet -> packet.time_start < model.tick - 1000 && !isempty(model.packet_xs[packet.seq]), model.packets)
 
     # worst case in terms of PDR to a single device
     worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)-1))
@@ -350,9 +365,27 @@ function getstats(model::AgentBasedModel)
     delivered = filter(p -> p.done == true, model.packets)
     delays = map(p -> p.time_done - p.time_start, delivered)
 
-    return ( PDR = length(delivered) / length(model.packets),
-             worstPDR = count(p -> p.done == false, deprived) / length(deprived),
-             delay = sum(delays) / length(delays) )
+    # probing centrality measure
+    devices = collect(allagents(model))
+    filter!(n -> n.role != :source, devices)
+
+    g = SimpleDiGraph(length(devices))
+
+    for (src_i, src) in enumerate(devices), (dst_i, dst) in enumerate(devices)
+        src.role == :relay || continue
+
+        if model.rssi_map[src_i, dst_i] > model.scanner_sensitivity
+            add_edge!(g, src.id, dst.id)
+        end
+    end
+
+    centrality = indegree_centrality(g, normalize=false) ./ length(devices) |> mean
+
+    return ( pdr = length(delivered) / length(model.packets),
+             worstpdr = count(p -> p.done == true, deprived) / length(deprived),
+             delay = mean(delays),
+             centrality = centrality,
+             packetloss = model.packets_lost / model.transmitters_count)
 end
 
 """
