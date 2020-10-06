@@ -9,7 +9,7 @@ mutable struct Packet
     done :: Bool
 end
 
-Base.@kwdef mutable struct Node <: AbstractAgent
+Base.@kwdef mutable struct Xode <: AbstractAgent
     id::Int
 
     # (x, y) coordinates
@@ -37,7 +37,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     t_scan_interval :: UInt = 20
 
     # the length of the interval before advertising the received packet
-    t_back_off_delay :: UInt = 10
+    t_back_off_delay :: UInt = 50
 
     # the number of extra retransmissions of the received packet
     n_retx_transmit_count :: UInt = 0
@@ -62,6 +62,8 @@ Base.@kwdef mutable struct Node <: AbstractAgent
 
     # own ttl for the current packet
     packet_ttl :: UInt8 = 0
+
+    pocket = CircularBuffer{Tuple{Int, Int, UInt8}}(20)
 end
 
 Base.@kwdef mutable struct Source <: AbstractAgent

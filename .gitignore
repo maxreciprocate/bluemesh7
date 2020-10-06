@@ -1,3 +1,7 @@
 *.ipynb
 *.org
+*.bson
+*.png
+*.svg
+*.mem
 archive/

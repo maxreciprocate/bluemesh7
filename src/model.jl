@@ -3,46 +3,62 @@ export generate_positions, initialize_mesh, start, getstats, plotgraph
 const ble_37_channel_wavelength = 0.12491352
 const part_of_path_loss_for_37 = (ble_37_channel_wavelength / (4 * π))^2
 
-function agent_step!(source::Source, model::AgentBasedModel)
-    if rand() < model.packet_emit_rate
-        # move off to a random position
-        move_agent!(source, model)
+# function agent_step!(source::Source, model::AgentBasedModel)
+#     if rand() < model.packet_emit_rate
+#         # move off to a random position
+#         move_agent!(source, model)
 
-        # generate next packet
-        source.packet_seq = length(model.packets) + 1
-        source.packet_ttl = model.ttl
-        packet = Packet(source.packet_seq, source.id, rand(1:nagents(model)-1), model.ttl, model.tick, 0, false)
-        push!(model.packets, packet)
-        model.packet_xs[packet.seq] = Int[]
+#         # generate next packet
+#         source.packet_seq = length(model.packets) + 1
+#         source.packet_ttl = model.ttl
+#         packet = Packet(source.packet_seq, source.id, rand(1:nagents(model)-1), model.ttl, model.tick, 0, false)
+#         push!(model.packets, packet)
+#         model.packet_xs[packet.seq] = Int[]
 
-        source.event_start = model.tick
-    end
+#         source.event_start = model.tick
+#     end
 
-    source.packet_seq == 0 && return
-    model.tick < source.event_start && return
+#     source.packet_seq == 0 && return
+#     model.tick < source.event_start && return
 
-    d, r = divrem(model.tick - source.event_start, source.t_interpdu)
-    source.transmitting = r == 0
-    source.channel = d + 37
+#     d, r = divrem(model.tick - source.event_start, source.t_interpdu)
+#     source.transmitting = r == 0
+#     source.channel = d + 37
 
-    if source.channel > 39
-        if source.n_transmit_left > 0
-            source.event_start = model.tick + source.t_og_transmit_delay + rand(source.rt_og_random_delay)
-            source.n_transmit_left -= 1
-            return
-        end
+#     if source.channel > 39
+#         if source.n_transmit_left > 0
+#             source.event_start = model.tick + source.t_og_transmit_delay + rand(source.rt_og_random_delay)
+#             source.n_transmit_left -= 1
+#             return
+#         end
 
-        # back to resting
-        source.packet_seq = 0
-        source.transmitting = false
-        source.n_transmit_left = source.n_og_transmit_count
+#         # back to resting
+#         source.packet_seq = 0
+#         source.transmitting = false
+#         source.n_transmit_left = source.n_og_transmit_count
+#     end
+# end
+# ■
+
+function randexclude(range::UnitRange{T}, exclude::T) where T
+    while true
+        x = rand(range)
+        x != exclude && return x
     end
 end
 
-function agent_step!(node::Node, model::AgentBasedModel)
-    if node.state == :scanning
-        # scanning happens every tick (assuming here scan_window == scan_interval)
+# ■
+function agent_step!(node::Xode, model::AgentBasedModel)
+    if rand() < model.packet_emit_rate / model.n
+        packet_seq = length(model.packets) + 1
+        packet = Packet(packet_seq, node.id, randexclude(1:model.n, node.id), model.ttl, model.tick, 0, false)
+        push!(model.packets, packet)
+        # @show packet_seq, length(model.packets)
+        model.packet_xs[packet.seq] = Int[]
+        push!(node.pocket, (model.tick + rand(1:node.t_back_off_delay), packet_seq, model.ttl))
+    end
 
+    if node.state == :scanning
         node.channel = div(abs(model.tick - node.event_start), node.t_scan_interval) + 37
 
         # no packets acquired, repeat scanning
@@ -51,44 +67,30 @@ function agent_step!(node::Node, model::AgentBasedModel)
             node.event_start = model.tick
         end
 
-        node.packet_seq == 0 && return
+        # there is no more job for sinks here
+        if node.role == :relay && node.packet_seq != 0 && !(node.packet_seq in node.received_packets)
+            # println("$(node.packet_seq)--------> $(node.id)")
 
-        # we've seen this seq recently
-        if node.packet_seq in node.received_packets
-            node.packet_seq = 0
-            return
-        end
+            push!(node.received_packets, node.packet_seq)
 
-        push!(node.received_packets, node.packet_seq)
-
-        packet = model.packets[node.packet_seq]
-
-        if node.packet_ttl == 1
-            node.packet_seq = 0
-            return
-        end
-
-        node.packet_ttl -= 1
-
-        if node.role == :relay
-            # initiating back-off delay before advertising this packet
-            node.event_start = model.tick + node.t_back_off_delay + rand(1:3)
-            node.state = :advertising
-
-            return
+            # for the sake of generality our own packets are treated the same way as others'
+            if node.packet_ttl > 1
+                # put a packet in the pocket
+                push!(node.pocket, (model.tick + rand(1:node.t_back_off_delay), node.packet_seq, node.packet_ttl - 1))
+            end
         end
     end
 
-    node.role != :relay && return
+    # @show node.id node.pocket node.state node.channel
+    # check for timeout for the first packet in the pocket
+    if !isempty(node.pocket) && model.tick >= node.pocket[1][1]
+        node.state = :advertising
+        node.event_start = model.tick
+    end
 
     if node.state == :advertising
-        model.tick < node.event_start && return
-
-        # return to scanning if the packet is absent
-        if node.packet_seq == 0
-            node.state = :scanning
-            node.event_start = model.tick + 1
-            return
+        if model.tick == node.event_start
+            _, node.packet_seq, node.packet_ttl = popfirst!(node.pocket)
         end
 
         d, r = divrem(abs(model.tick - node.event_start), node.t_interpdu)
@@ -101,12 +103,7 @@ function agent_step!(node::Node, model::AgentBasedModel)
         if node.channel > 39
             # bonus retransmissions for the original/retx packet
             if node.n_transmit_left > 0
-                node.event_start = model.tick + node.t_retx_transmit_delay + rand(node.rt_retx_random_delay)
-
-                node.n_transmit_left -= 1
-                node.channel = 37
-
-                return
+                push!(node.pocket, (model.tick + node.t_back_off_delay, node.packet_seq, node.packet_ttl))
             end
 
             node.packet_seq = 0
@@ -131,7 +128,7 @@ function xvmap!(arr::SubArray, func::Function)
     arr2
 end
 
-function calc_rssi!(agents::Vector{Union{Node, Source}}, P_tx::Vector{Float64})
+function calc_rssi!(agents, P_tx::Vector{Float64})
     n = length(agents)
     rssi_map = Matrix{Float64}(undef, n, n)
 
@@ -158,27 +155,28 @@ function calc_rssi!(agents::Vector{Union{Node, Source}}, P_tx::Vector{Float64})
     rssi_map
 end
 
-function recalc_sources_rssi!(agents::Vector{Union{Node, Source}}, rssi_map:: Matrix{Float64}, P_tx::Vector{Float64})
-    n = length(agents)
+# function recalc_sources_rssi!(agents::Vector{Union{Bode, Source}}, rssi_map:: Matrix{Float64}, P_tx::Vector{Float64})
+#     n = length(agents)
 
-    source_i = 1
-    Lps = xvmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos))
+#     source_i = 1
+#     Lps = xvmap!(view(agents, 1:n), x -> 1 / distance(agents[source_i].pos, x.pos))
 
-    @avx for j in 1:n
-        Lps[j] = Lps[j] * part_of_path_loss_for_37
-        rssi_map[source_i, j] = P_tx[j] * Lps[j] # dB
-    end
+#     @avx for j in 1:n
+#         Lps[j] = Lps[j] * part_of_path_loss_for_37
+#         rssi_map[source_i, j] = P_tx[j] * Lps[j] # dB
+#     end
 
-    @avx for j in 1:n
-        rssi_map[j, source_i] = P_tx[source_i] * Lps[j] # dB
-    end
+#     @avx for j in 1:n
+#         rssi_map[j, source_i] = P_tx[source_i] * Lps[j] # dB
+#     end
 
-    rssi_map[source_i, source_i] = 0
+#     rssi_map[source_i, source_i] = 0
 
-    nothing
-end
+#     nothing
+# end
 
 function model_step!(model::AgentBasedModel)
+    # println(model.tick)
     all_agents = collect(allagents(model))
 
     transmitters = [
@@ -188,15 +186,16 @@ function model_step!(model::AgentBasedModel)
     ]
 
     transmitters_count = sum(sum(transmitters))
+    # transmitters_count > 0 && @show transmitters_count
     count_successes = zeros(Int, nagents(model))
 
     # (pomdp): clear previous reward nominees
     empty!(model.reward_plate)
 
-    recalc_sources_rssi!(all_agents, model.rssi_map, model.tx_powers)
+    # recalc_sources_rssi!(all_agents, model.rssi_map, model.tx_powers)
 
     for (dst_i, dst) in enumerate(all_agents)
-        (dst.state == :scanning && dst.packet_seq == 0) || continue
+        dst.state == :scanning || continue
 
         rssi_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
 
@@ -205,9 +204,9 @@ function model_step!(model::AgentBasedModel)
         neighbours_agents = all_agents[transmitters[dst.channel - 36]]
 
         # add shadow and multipath fading
-        for idx in eachindex(rssi_neighbours)
-            rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
-        end
+        # for idx in eachindex(rssi_neighbours)
+        #     rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
+        # end
 
         # register background noise
         total = sum(rssi_neighbours) + 1e-15 # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
@@ -237,29 +236,22 @@ function model_step!(model::AgentBasedModel)
 
         tx_agent = neighbours_agents[src_i]
         packet = model.packets[tx_agent.packet_seq]
-        count_successes[tx_agent.id + 1] = 1
+        count_successes[tx_agent.id] = 1
 
-        packet.done && continue
-        # registering the touch upon this yet not delivered packet
-        push!(model.packet_xs[packet.seq], dst.id)
-
-        # this is mainly for the pomdp interface
         if packet.dst == dst.id
             # since the packet is delivered, acknowledge everyone participating
-            append!(model.reward_plate, model.packet_xs[packet.seq])
-        end
+            !packet.done && append!(model.reward_plate, model.packet_xs[packet.seq])
 
-        # marking the packet as delivered
-        if packet.dst == dst.id
+            # marking the packet as delivered
             packet.done = true
             packet.time_done = model.tick
-
-            continue
+        else
+            # registering the touch upon this yet not delivered packet
+            !packet.done && push!(model.packet_xs[packet.seq], dst.id)
+            # copying packet's reference
+            dst.packet_seq = packet.seq
+            dst.packet_ttl = neighbours_agents[src_i].packet_ttl
         end
-
-        # copying packet's reference
-        dst.packet_seq = packet.seq
-        dst.packet_ttl = neighbours_agents[src_i].packet_ttl
     end
 
     if transmitters_count > 0
@@ -310,14 +302,16 @@ generate_positions(; dims=(100, 100), n=64) = [(rand(1:dims[1]), rand(1:dims[2])
 
 Create a mesh by specifying roles of each node by `roles`=[0, 1, 0...] where 1 means that the node is a relay, sink otherwise, and including `positions`=[(Int, Int)...] as nodes' positions
 """
-function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
+function initialize_mesh(positions::Vector{NTuple{2, Int}}, roles::AbstractVector)
     length(roles) == length(positions) || throw(ArgumentError("Both arguments must be of equal length"))
-    n = length(roles) + 1
+    n = length(roles)
 
     properties = Dict(
+        :n => n,
         :tick => 0,
-        :packet_emit_rate => 20 / 1000,
+        :packet_emit_rate => 1 / 1000,
         :packets_lost => 0,
+        :transmitters_count => 0,
         :ttl => 5,
         :rssi_map => Matrix{Float64}(undef, n, n),
         :tx_powers => Vector{Float64}(undef, n),
@@ -332,23 +326,22 @@ function initialize_mesh(positions::Vector{Tuple{Int, Int}}, roles::Vector{Int})
         :packet_xs => Dict{Int, Vector{Int}}(),
         # plate for the actors who contributed to packet's successful delivery
         :reward_plate => Int[],
-        :transmitters_count => 0
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
-    model = ABM(Union{Source, Node}, space; properties, warn = false)
+    model = ABM(Xode, space; properties, warn = false)
 
-    source = Source(id = 0, pos = (1, 1))
-    model.tx_powers[1] = source.tx_power
-    add_agent_single!(source, model)
+    # source = Source(id = 0, pos = (1, 1))
+    # model.tx_powers[1] = source.tx_power
+    # add_agent_single!(source, model)
 
-    for i in 1:length(roles)
-        node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
+    for i in 1:model.n
+        node = Xode(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
 
         model.tx_powers[node.id] = node.tx_power
-        model.tx_powers[i + 1] = node.tx_power
+        model.tx_powers[i] = node.tx_power
     end
 
     model.rssi_map = calc_rssi!(collect(allagents(model)), model.tx_powers)
@@ -357,7 +350,7 @@ end
 
 function getstats(model::AgentBasedModel)
     # filter packets which were too recently produced, or produced in an unreachable position
-    filter!(packet -> packet.time_start < model.tick - 1000 && !isempty(model.packet_xs[packet.seq]), model.packets)
+    filter!(packet -> packet.time_start < model.tick - 500, model.packets)
 
     # worst case in terms of PDR to a single device
     worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)-1))
@@ -395,8 +388,19 @@ Start an experiment from `model` for the given number of minutes.
 """
 function start(model::AgentBasedModel; minutes = 1)
     steps = minutes * 60 * 1000
+    # steps = 200
 
     run!(model, agent_step!, model_step!, steps)
 
     getstats(model)
 end
+# ■
+
+# ps = generate_positions(dims=(40, 40), n = 64)
+# mesh = initialize_mesh(ps, ones(Int, size(ps)))
+# mesh = initialize_mesh(ps, rand(0:1, size(ps)))
+# mesh.packet_emit_rate = 10 / 1000
+# @time start(mesh, minutes = 1)
+# plotgraph(mesh)
+# mesh.packets
+# getstats(mesh)
