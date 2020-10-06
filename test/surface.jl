@@ -4,13 +4,12 @@ using Plots
 using Statistics: mean
 using ProgressMeter: @showprogress
 
-ngraphs = 7
+ngraphs = 4
 graphs = [generate_positions(dims=(30, 30), n=96) for _ = 1:ngraphs]
 # ■
 
-emit_rates = [1, collect(5:5:100)...] |> reverse
-setup_nrelays = collect(0:8:96) |> reverse
-sser = repr.(emit_rates)
+emit_rates = [1, collect(5:10:105)...] |> reverse
+setup_nrelays = collect(0:16:96) |> reverse
 
 # ■
 pdrs = []
@@ -38,9 +37,7 @@ end
 # ■
 
 p = plot(reverse(setup_nrelays), reverse(emit_rates), pdrs, st = :surface, camera=(60, 40),
-         xticks=([reverse(setup_nrelays);], setup_nrelays), yticks=([reverse(emit_rates);], sser),
+         xticks=([reverse(setup_nrelays);], setup_nrelays), yticks=([reverse(emit_rates);], emit_rates),
          xlabel="relays", ylabel="emit", zlabel="pdr")
 
-using Cairo, Compose
-
-savefig("resurfaced.png")
+savefig("resurfaced-more.png")

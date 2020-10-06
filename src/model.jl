@@ -204,9 +204,9 @@ function model_step!(model::AgentBasedModel)
         neighbours_agents = all_agents[transmitters[dst.channel - 36]]
 
         # add shadow and multipath fading
-        # for idx in eachindex(rssi_neighbours)
-        #     rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
-        # end
+        for idx in eachindex(rssi_neighbours)
+            rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
+        end
 
         # register background noise
         total = sum(rssi_neighbours) + 1e-15 # + max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
