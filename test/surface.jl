@@ -3,6 +3,7 @@ include("../src/BlueMesh7.jl")
 using Plots
 using Statistics: mean
 using ProgressMeter: @showprogress
+using BSON: @save
 
 ngraphs = 4
 graphs = [generate_positions(dims=(30, 30), n=96) for _ = 1:ngraphs]
@@ -34,6 +35,8 @@ pdrs = []
         push!(pdrs, mean(localpdrs))
     end
 end
+
+@save "surface.bson" pdrs
 # ■
 
 p = plot(reverse(setup_nrelays), reverse(emit_rates), pdrs, st = :surface, camera=(60, 40),
