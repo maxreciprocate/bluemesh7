@@ -1,7 +1,11 @@
 export generate_positions, initialize_mesh, start, getstats, plotgraph
 
+to_mW(dBm) = 10^(dBm / 10)
+
 const ble_37_channel_wavelength = 0.12491352
 const part_of_path_loss_for_37 = (ble_37_channel_wavelength / (4 * π))^2
+const message_length = 312
+const scanner_sensitivity = to_mW(-95)
 
 function randexclude(range::UnitRange{T}, exclude::T) where T
     while true
@@ -11,7 +15,7 @@ function randexclude(range::UnitRange{T}, exclude::T) where T
 end
 
 # ■
-function agent_step!(node::Xode, model::AgentBasedModel)
+function agent_step!(node::Node, model::AgentBasedModel)
     # produce a packet and store it in the queue for later
     if rand() < model.packet_emit_rate / model.n
         packet_seq = length(model.packets) + 1
@@ -24,6 +28,7 @@ function agent_step!(node::Xode, model::AgentBasedModel)
     end
 
     if node.state == :scanning
+        node.event_start > model.tick && return
         node.channel = div(abs(model.tick - node.event_start), node.t_scan_interval) + 37
 
         # no packets acquired, repeat scanning
@@ -51,6 +56,7 @@ function agent_step!(node::Xode, model::AgentBasedModel)
     end
 
     if node.state == :advertising
+        node.event_start > model.tick && return
         if model.tick == node.event_start
             _, node.packet_seq, node.packet_ttl = popfirst!(node.pocket)
         end
@@ -108,64 +114,85 @@ function calc_rssi!(agents, P_tx::Vector{Float64})
     rssi_map
 end
 
+function calculate_par!(rssi_neighbourhood::Vector{Float64}, total_rssi::Float64)
+    total_par = 0.0
+
+    @inbounds for idx in eachindex(rssi_neighbourhood)
+        rssi_neighbourhood[idx] == 0 && continue
+
+        SINR = rssi_neighbourhood[idx] / (total_rssi - rssi_neighbourhood[idx])
+        BER = 0.5 * erfc(sqrt(SINR / 2))
+        PAR = (1 - BER)^message_length
+
+        rssi_neighbourhood[idx] = PAR
+        total_par += PAR
+    end
+
+    total_par
+end
+
+function select_rssi!(rssi_neighbourhood::Vector{Float64}, rssi_map::SubArray{Float64}, transmitters::CircularBuffer{Int})
+    total_rssi = 0.0
+
+    @inbounds for idx in transmitters
+        rssi = rssi_map[idx]
+
+        total_rssi += rssi
+        if rssi > scanner_sensitivity
+            rssi_neighbourhood[idx] = rssi
+        end
+    end
+
+    total_rssi
+end
+
 function model_step!(model::AgentBasedModel)
-    all_agents = collect(allagents(model))
+    transmitters_count = 0
 
-    transmitters = [
-            [a.transmitting && a.channel == 37 for a in all_agents],
-            [a.transmitting && a.channel == 38 for a in all_agents],
-            [a.transmitting && a.channel == 39 for a in all_agents]
-    ]
+    for agent in allagents(model)
+        if agent.transmitting
+            push!(model.transmitters[agent.channel - 36], agent.id)
+            transmitters_count += 1
+        end
+    end
 
-    transmitters_count = sum(sum(transmitters))
-    count_successes = zeros(Int, nagents(model))
+    # transmitters_count = sum(sum(model.transmitters))
+    # @show model.transmitters, transmitters_count
+    # count_successes = zeros(Int, nagents(model))
 
     # (pomdp): clear previous reward nominees
     empty!(model.reward_plate)
 
-    for (dst_i, dst) in enumerate(all_agents)
+    if iszero(transmitters_count)
+        model.tick += 1
+        return
+    end
+
+    rssi_neighbourhood = zeros(model.n)
+
+    for dst in allagents(model)
         dst.state == :scanning || continue
 
-        rssi_neighbours = model.rssi_map[dst_i, transmitters[dst.channel - 36]]
+        # select RSSI of only transmitting devices reachable to here
+        # begs the question whether RSSI can be calculated on the fly
+        fill!(rssi_neighbourhood, 0)
 
-        isempty(rssi_neighbours) && continue
+        txs = model.transmitters[dst.channel - 36]
+        total_rssi = select_rssi!(rssi_neighbourhood, view(model.rssi_map, :, dst.id), txs)
 
-        neighbours_agents = all_agents[transmitters[dst.channel - 36]]
+        iszero(total_rssi) && continue
 
-        # add shadow and multipath fading
-        # for idx in eachindex(rssi_neighbours)
-        #     rssi_neighbours[idx] /= to_mW(rand(model.shadow_d) + rand(model.multipath_d))
-        # end
-
-        # register background noise
-        total = sum(rssi_neighbours) + 1e-18 # max(rand(model.wifi_noise_d), 0) + max(rand(model.gaussian_noise), 0)
-
-        # filter unreachable sources
-        visible_mask = [rssi > model.scanner_sensitivity for rssi in rssi_neighbours]
-        rssi_neighbours = rssi_neighbours[visible_mask]
-        neighbours_agents = neighbours_agents[visible_mask]
-
-        isempty(rssi_neighbours) && continue
-
-        message_length = model.msg_bit_length
-
-        # after this step rssi_neighbours become par_neighbours
-        for (idx, rssi) in enumerate(rssi_neighbours)
-            SINR = rssi / (total - rssi)
-            BER = 0.5 * erfc(sqrt(SINR / 2))
-            rssi_neighbours[idx] = (1 - BER)^message_length
-        end
-
-        total_PAR = sum(rssi_neighbours)
+        total_par = calculate_par!(rssi_neighbourhood, total_rssi)
 
         # do any of this packets pass?
-        rand() <= total_PAR || continue
+        rand() <= total_par || continue
 
-        src_i = sample(1:length(rssi_neighbours), Weights(rssi_neighbours))
+        tx_id = sample(1:length(txs), Weights(rssi_neighbourhood[1:length(txs)]))
+        source_id = txs[tx_id]
 
-        tx_agent = neighbours_agents[src_i]
-        packet = model.packets[tx_agent.packet_seq]
-        count_successes[tx_agent.id] = 1
+        # @show model[source_id]
+        packet = model.packets[model[source_id].packet_seq]
+        # count_successes[source_id] = 1
 
         if packet.dst == dst.id
             if !packet.done
@@ -182,18 +209,25 @@ function model_step!(model::AgentBasedModel)
 
             # copy packet's reference and source's ttl
             dst.packet_seq = packet.seq
-            dst.packet_ttl = neighbours_agents[src_i].packet_ttl
+            dst.packet_ttl = model[source_id].packet_ttl
+            # dst.packet_rssi = neighbours_agents[src_i].packet_ttl
         end
+
+        fill!(rssi_neighbourhood, 0.0)
     end
 
-    if transmitters_count > 0
-        model.packets_lost += transmitters_count - sum(count_successes)
-        model.transmitters_count += transmitters_count
+    # if transmitters_count > 0
+    #     model.packets_lost += transmitters_count - sum(count_successes)
+    #     model.transmitters_count += transmitters_count
+    # end
+
+    # reset transmitter signaling array
+    for idx = 1:3
+        empty!(model.transmitters[idx])
     end
 
     model.tick += 1
 end
-
 
 function plotgraph(model::AgentBasedModel)
     g = SimpleGraph(nagents(model))
@@ -219,7 +253,6 @@ function plotgraph(model::AgentBasedModel)
     gplot(g, xs, ys; nodefillc = cs)
 end
 
-to_mW(dBm) = 10^(dBm / 10)
 
 """
     generate_positions(; dims = (200, 200), n = 100) → positions::Array{Tuple{Int,Int},1}
@@ -241,13 +274,13 @@ function initialize_mesh(positions::Vector{NTuple{2, Int}}, roles::AbstractVecto
         :n => n,
         :tick => 0,
         :packet_emit_rate => 1 / 1000,
+        :transmitters => [CircularBuffer{Int}(n) for _ = 1:3],
         :packets_lost => 0,
         :transmitters_count => 0,
         :ttl => 5,
         :rssi_map => Matrix{Float64}(undef, n, n),
         :tx_powers => Vector{Float64}(undef, n),
         :scanner_sensitivity => to_mW(-95),
-        :msg_bit_length => 312,
         :shadow_d => LogNormal(0, 1),
         :multipath_d => Rayleigh(4),
         :wifi_noise_d => Normal((to_mW(-125) - to_mW(-135)) / 2 + to_mW(-135), (to_mW(-125) - to_mW(-135)) / 2),
@@ -260,10 +293,10 @@ function initialize_mesh(positions::Vector{NTuple{2, Int}}, roles::AbstractVecto
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
-    model = ABM(Xode, space; properties, warn = false)
+    model = ABM(Node, space; properties, warn = false)
 
     for i in 1:model.n
-        node = Xode(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
+        node = Node(id = i; pos = positions[i], role = roles[i] == 1 ? :relay : :sink)
 
         add_agent_pos!(node, model)
 
@@ -280,7 +313,7 @@ function getstats(model::AgentBasedModel)
     filter!(packet -> packet.time_start < model.tick - 500, model.packets)
 
     # worst case in terms of PDR to a single device
-    worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)-1))
+    worstnode = argmax(map(id -> count(p -> p.dst == id && p.done == false, model.packets), 1:nagents(model)))
     deprived = filter(p -> p.dst == worstnode, model.packets)
     delivered = filter(p -> p.done == true, model.packets)
     delays = map(p -> p.time_done - p.time_start, delivered)
@@ -321,10 +354,28 @@ function start(model::AgentBasedModel; minutes = 1)
     getstats(model)
 end
 
-# ps = generate_positions(dims=(10, 10), n = 20)
+# 40.347059 seconds (454.72 M allocations: 12.967 GiB, 5.06% gc time)
+
+# ps = generate_positions(dims=(30, 30), n = 64)
 # mesh = initialize_mesh(ps, ones(Int, size(ps)))
-# mesh = initialize_mesh(ps, rand(0:1, size(ps)))
-# mesh.packet_emit_rate = 20 / 1000
+# mesh.packet_emit_rate = 1 / 1000
 # @time start(mesh, minutes = 1)
-# plotgraph(mesh)
-# collect(getstats(mesh))
+
+# stats1 = collect(getstats(mesh))
+
+# mesh = initialize_mesh(ps, rand(0:1, size(ps)))
+# mesh.packet_emit_rate = 50 / 1000
+# @time start(mesh, minutes = 1)
+# stats2 = collect(getstats(mesh))
+
+# stats1 .- stats2
+# mesh.rssi_map .== 1
+
+# zeros(Bool, 2, 2) |> BitArray
+
+# nbours = mesh.rssi_map[BitArray([1, 1, 1, 0]), 1]
+
+# nbours
+# nbours[nbours .< 3e-9] .= 0
+
+# typeof(@view mesh.rssi_map[:, 1])
