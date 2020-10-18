@@ -1,17 +1,18 @@
 include("../src/BlueMesh7.jl")
-using .BlueMesh7
-# ■
+# using .BlueMesh7
 
 using Random
 using DataFrames
 using Statistics: mean
-using ProgressMeter: @showprogress
+using ProgressMeter
 using BSON: @load, @save
+using Flux
+using CUDA
 # ■
 
 benchmark = DataFrame()
 minutes = 7
-ngraphs = 7
+ngraphs = 4
 
 nactors = [32, 64, 96]
 dims = [(25, 25), (30, 30), (35, 35)]
@@ -22,6 +23,7 @@ results = DataFrame()
 Random.seed!(7)
 allgraphs = [generate_positions(; n, dims) for _ = 1:ngraphs, (dims, n) in setups]
 
+Progress(10kk)
 function bench(name, benchmark; init, unroll)
     println("Benching $(name)")
     bench_stats = DataFrame()
@@ -37,9 +39,12 @@ function bench(name, benchmark; init, unroll)
             unlock(spin)
 
             Random.seed!(7)
-            stats = unroll(mesh, setup, minutes)
+            stats = unroll(mesh, minutes)
 
+            # since when it's not thread safe
+            lock(spin)
             push!(setup_stats, stats)
+            unlock(spin)
         end
 
         @assert nrow(setup_stats) == ngraphs
@@ -56,11 +61,11 @@ end
 
 bench("All relays (0)", benchmark,
       init = coordinates -> initialize_mesh(coordinates, ones(Int, length(coordinates))),
-      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+      unroll = (mesh, minutes) -> start(mesh; minutes))
 
 bench("Half relays (0)", benchmark,
       init = coordinates -> initialize_mesh(coordinates, rand(0:1, length(coordinates))),
-      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+      unroll = (mesh, minutes) -> start(mesh; minutes))
 
 using PyCall
 pushfirst!(PyVector(pyimport("sys")."path"), "../test/ble-mesh-algorithms/standard-algorithms/")
@@ -81,34 +86,21 @@ end
 
 bench("Connect (1)", benchmark,
       init = coordinates -> init_rssi_to_adjacency(coordinates, greedy.greedy_connect),
-      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+      unroll = (mesh, minutes) -> start(mesh; minutes))
 
 bench("Dominator (1)", benchmark,
       init = coordinates -> init_rssi_to_adjacency(coordinates, dominator.dominator),
-      unroll = (mesh, setup, minutes) -> start(mesh; minutes))
+      unroll = (mesh, minutes) -> start(mesh; minutes))
 
-@load "../solving/MC-EXP-FREQ.bson" Q
+@load "model.bson" model
 
-tilings = [0, 1, 2, 3, [4 * idx for idx = 1:24]...] |> reverse
-function tile(nbours::Int)
-    for idx in 1:length(tilings)
-        if tilings[idx] <= nbours
-            return idx
-        end
-    end
-end
+function unroll_mc(env, minutes)
+    moves = zeros(env.model.n)
+    S = get_state(env)
 
-function unroll_mc(env, setup, minutes)
-    na = length(env.positions)
-    moves = zeros(Int, na)
-    idim = setup[1][1] ÷ 5 - 4
-    ina = setup[2] ÷ 32
+    ps = model(S) |> softmax
 
-    for a in 1:na
-        nbours, _ = get_state(env, a)
-
-        moves[a] = argmax(Q[:, tile(nbours), ina, idim])
-    end
+    moves = rand.(mapslices(Categorical, ps', dims=2)) |> vec
 
     env(moves)
 
@@ -116,14 +108,15 @@ function unroll_mc(env, setup, minutes)
         env(moves, true)
     end
 
-    getstats(env.mesh)
+    getstats(env.model)
 end
 
 bench("Monte Carlo (3)", benchmark,
       init = (positions) -> BlueMesh7Env(positions),
       unroll = unroll_mc)
+
 # ■
 
 using Dates
 datenow = Date(now())
-@save "benchmark-retx-$(datenow).bson" benchmark
+@save "benchmark-$(datenow).bson" benchmark

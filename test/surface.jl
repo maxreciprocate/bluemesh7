@@ -3,13 +3,13 @@ include("../src/BlueMesh7.jl")
 using Plots
 using Statistics: mean
 using ProgressMeter: @showprogress
-using BSON: @save
+using BSON: @save, @load
 
 ngraphs = 4
 graphs = [generate_positions(dims=(30, 30), n=96) for _ = 1:ngraphs]
 # ■
 
-emit_rates = [1, collect(5:10:105)...] |> reverse
+emit_rates = collect(10:10:50) |> reverse
 setup_nrelays = collect(0:16:96) |> reverse
 
 # ■
@@ -42,5 +42,5 @@ end
 p = plot(reverse(setup_nrelays), reverse(emit_rates), pdrs, st = :surface, camera=(60, 40),
          xticks=([reverse(setup_nrelays);], setup_nrelays), yticks=([reverse(emit_rates);], emit_rates),
          xlabel="relays", ylabel="emit", zlabel="pdr")
-
+p
 savefig("resurfaced-more.png")

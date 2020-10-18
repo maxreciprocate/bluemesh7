@@ -1,5 +1,5 @@
 include("../src/BlueMesh7.jl")
-using .BlueMesh7
+# using .BlueMesh7
 
 function run()
     positions = generate_positions(dims=(30, 30), n=64)

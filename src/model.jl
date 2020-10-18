@@ -169,6 +169,7 @@ function model_step!(model::AgentBasedModel)
     end
 
     rssi_neighbourhood = zeros(model.n)
+    count_successes = zeros(model.n)
 
     for dst in allagents(model)
         dst.state == :scanning || continue
@@ -192,7 +193,7 @@ function model_step!(model::AgentBasedModel)
 
         # @show model[source_id]
         packet = model.packets[model[source_id].packet_seq]
-        # count_successes[source_id] = 1
+        count_successes[source_id] = 1
 
         if packet.dst == dst.id
             if !packet.done
@@ -216,10 +217,10 @@ function model_step!(model::AgentBasedModel)
         fill!(rssi_neighbourhood, 0.0)
     end
 
-    # if transmitters_count > 0
-    #     model.packets_lost += transmitters_count - sum(count_successes)
-    #     model.transmitters_count += transmitters_count
-    # end
+    if transmitters_count > 0
+        model.packets_lost += transmitters_count - sum(count_successes)
+        model.transmitters_count += transmitters_count
+    end
 
     # reset transmitter signaling array
     for idx = 1:3
@@ -273,7 +274,7 @@ function initialize_mesh(positions::Vector{NTuple{2, Int}}, roles::AbstractVecto
     properties = Dict(
         :n => n,
         :tick => 0,
-        :packet_emit_rate => 1 / 1000,
+        :packet_emit_rate => 50 / 1000,
         :transmitters => [CircularBuffer{Int}(n) for _ = 1:3],
         :packets_lost => 0,
         :transmitters_count => 0,
@@ -358,24 +359,12 @@ end
 
 # ps = generate_positions(dims=(30, 30), n = 64)
 # mesh = initialize_mesh(ps, ones(Int, size(ps)))
-# mesh.packet_emit_rate = 1 / 1000
 # @time start(mesh, minutes = 1)
 
 # stats1 = collect(getstats(mesh))
 
 # mesh = initialize_mesh(ps, rand(0:1, size(ps)))
-# mesh.packet_emit_rate = 50 / 1000
 # @time start(mesh, minutes = 1)
 # stats2 = collect(getstats(mesh))
 
 # stats1 .- stats2
-# mesh.rssi_map .== 1
-
-# zeros(Bool, 2, 2) |> BitArray
-
-# nbours = mesh.rssi_map[BitArray([1, 1, 1, 0]), 1]
-
-# nbours
-# nbours[nbours .< 3e-9] .= 0
-
-# typeof(@view mesh.rssi_map[:, 1])

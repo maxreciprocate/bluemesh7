@@ -39,7 +39,7 @@ function (env::BlueMesh7Env)(moves::Vector{Int}, eval=false)
     end
 
     for packet in env.model.packets
-        if packet.done || env.model.tick - packet.time_start > 1000
+        if packet.done || env.model.tick - packet.time_start > 5000
             continue
         end
 
@@ -51,12 +51,13 @@ end
 
 function get_state(env::BlueMesh7Env)
     # count of neighbours which pass our sensitivity threshold
-    nbours = count.(env.model.rssi_map[:, id] .> mesh.scanner_sensitivity for id = 1:env.model.n)
+    nbours = count.(env.model.rssi_map[:, id] .> env.model.scanner_sensitivity for id = 1:env.model.n)
+    nactors = [env.model.n for _ = 1:env.model.n]
 
     # some information about the neighbourhood
     # about recent packet history
     # about the current packet
-    nbours
+    hcat(nbours, nactors)'
 end
 
 function get_reward(env::BlueMesh7Env)
