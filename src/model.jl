@@ -14,7 +14,6 @@ function randexclude(range::UnitRange{T}, exclude::T) where T
     end
 end
 
-# ■
 function agent_step!(node::Node, model::AgentBasedModel)
     # produce a packet and store it in the queue for later
     if rand() < model.packet_emit_rate / model.n
@@ -103,7 +102,7 @@ function calc_rssi!(agents, P_tx::Vector{Float64})
         end
     end
 
-    @avx for i in 1:n
+    for i in 1:n
         for j in 1:n
             rssi_map[i, j] = P_tx[j] * L_p[i, j] * part_of_path_loss_for_37 # dB
         end
@@ -155,10 +154,6 @@ function model_step!(model::AgentBasedModel)
             transmitters_count += 1
         end
     end
-
-    # transmitters_count = sum(sum(model.transmitters))
-    # @show model.transmitters, transmitters_count
-    # count_successes = zeros(Int, nagents(model))
 
     # (pomdp): clear previous reward nominees
     empty!(model.reward_plate)
@@ -290,7 +285,7 @@ function initialize_mesh(positions::Vector{NTuple{2, Int}}, roles::AbstractVecto
         # packet.seq => nodes that have touched that packet
         :packet_xs => Dict{Int, Vector{Int}}(),
         # plate for the actors who contributed to packet's successful delivery
-        :reward_plate => Int[],
+        :reward_plate => Int[]
     )
 
     space = GridSpace((maximum(first.(positions)), maximum(last.(positions))))
@@ -339,7 +334,7 @@ function getstats(model::AgentBasedModel)
              worstpdr = count(p -> p.done == true, deprived) / length(deprived),
              delay = mean(delays),
              centrality = centrality,
-             packetloss = model.packets_lost / model.transmitters_count)
+             packetloss = model.packets_lost / model.transmitters_count )
 end
 
 """
@@ -354,17 +349,3 @@ function start(model::AgentBasedModel; minutes = 1)
 
     getstats(model)
 end
-
-# 40.347059 seconds (454.72 M allocations: 12.967 GiB, 5.06% gc time)
-
-# ps = generate_positions(dims=(30, 30), n = 64)
-# mesh = initialize_mesh(ps, ones(Int, size(ps)))
-# @time start(mesh, minutes = 1)
-
-# stats1 = collect(getstats(mesh))
-
-# mesh = initialize_mesh(ps, rand(0:1, size(ps)))
-# @time start(mesh, minutes = 1)
-# stats2 = collect(getstats(mesh))
-
-# stats1 .- stats2

@@ -1,5 +1,7 @@
 include("../src/BlueMesh7.jl")
+using .BlueMesh7
 
+using Random
 using Plots
 using Statistics: mean
 using ProgressMeter: @showprogress
@@ -42,5 +44,6 @@ end
 p = plot(reverse(setup_nrelays), reverse(emit_rates), pdrs, st = :surface, camera=(60, 40),
          xticks=([reverse(setup_nrelays);], setup_nrelays), yticks=([reverse(emit_rates);], emit_rates),
          xlabel="relays", ylabel="emit", zlabel="pdr")
-p
+
 savefig("resurfaced-more.png")
+println("wrote resurfaced-more.png")

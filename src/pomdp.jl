@@ -6,7 +6,7 @@ mutable struct BlueMesh7Env
     rewards :: Vector{Float64}
 end
 
-function BlueMesh7Env(dims = (100, 100), n = 64)
+function BlueMesh7Env(dims = (40, 40), n = 64)
     positions = generate_positions(; dims, n)
     model = initialize_mesh(positions, zeros(Int, n))
 
@@ -32,11 +32,7 @@ function (env::BlueMesh7Env)(moves::Vector{Int}, eval=false)
     # no need for rewards if no one is going to get them
     eval && return
 
-    fill!(env.rewards, 0.0)
-
-    for id in env.model.reward_plate
-        env.rewards[id] += 100.0
-    end
+    fill!(env.rewards, 0)
 
     for packet in env.model.packets
         if packet.done || env.model.tick - packet.time_start > 5000
@@ -44,7 +40,7 @@ function (env::BlueMesh7Env)(moves::Vector{Int}, eval=false)
         end
 
         for x in env.model.packet_xs[packet.seq]
-            env.rewards[x] -= 1.0
+            env.rewards[x] = -1
         end
     end
 end
@@ -54,9 +50,6 @@ function get_state(env::BlueMesh7Env)
     nbours = count.(env.model.rssi_map[:, id] .> env.model.scanner_sensitivity for id = 1:env.model.n)
     nactors = [env.model.n for _ = 1:env.model.n]
 
-    # some information about the neighbourhood
-    # about recent packet history
-    # about the current packet
     hcat(nbours, nactors)'
 end
 

@@ -31,7 +31,7 @@ Base.@kwdef mutable struct Node <: AbstractAgent
     transmitting :: Bool = false
 
     # the length of the interval between transmissions on different channels (ms)
-    t_interpdu :: UInt = 5
+    t_interpdu :: UInt = 10
 
     # the length of the interval between scanning on different channels (ms)
     t_scan_interval :: UInt = 20

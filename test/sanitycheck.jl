@@ -1,5 +1,5 @@
 include("../src/BlueMesh7.jl")
-# using .BlueMesh7
+using .BlueMesh7
 
 using Random
 using DataFrames
@@ -23,7 +23,6 @@ results = DataFrame()
 Random.seed!(7)
 allgraphs = [generate_positions(; n, dims) for _ = 1:ngraphs, (dims, n) in setups]
 
-Progress(10kk)
 function bench(name, benchmark; init, unroll)
     println("Benching $(name)")
     bench_stats = DataFrame()
@@ -67,30 +66,30 @@ bench("Half relays (0)", benchmark,
       init = coordinates -> initialize_mesh(coordinates, rand(0:1, length(coordinates))),
       unroll = (mesh, minutes) -> start(mesh; minutes))
 
-using PyCall
-pushfirst!(PyVector(pyimport("sys")."path"), "../test/ble-mesh-algorithms/standard-algorithms/")
-greedy = pyimport("greedy_algorithms")
-dominator = pyimport("dominator_algorithm")
+# using PyCall
+# pushfirst!(PyVector(pyimport("sys")."path"), "../test/ble-mesh-algorithms/standard-algorithms/")
+# greedy = pyimport("greedy_algorithms")
+# dominator = pyimport("dominator_algorithm")
 
-function init_rssi_to_adjacency(coordinates::Vector{NTuple{2, Int}}, Oracle)
-    protomesh = initialize_mesh(coordinates, ones(Int, length(coordinates)))
-    mask = protomesh.rssi_map .> protomesh.scanner_sensitivity + 1e-10
+# function init_rssi_to_adjacency(coordinates::Vector{NTuple{2, Int}}, Oracle)
+#     protomesh = initialize_mesh(coordinates, ones(Int, length(coordinates)))
+#     mask = protomesh.rssi_map .> protomesh.scanner_sensitivity + 1e-10
 
-    adjacency = zeros(Int, size(protomesh.rssi_map))
-    adjacency[mask] .= 1
-    adjacency = adjacency[2:end, 2:end]
+#     adjacency = zeros(Int, size(protomesh.rssi_map))
+#     adjacency[mask] .= 1
+#     adjacency = adjacency[2:end, 2:end]
 
-    roles = Oracle(adjacency)
-    initialize_mesh(coordinates, roles)
-end
+#     roles = Oracle(adjacency)
+#     initialize_mesh(coordinates, roles)
+# end
 
-bench("Connect (1)", benchmark,
-      init = coordinates -> init_rssi_to_adjacency(coordinates, greedy.greedy_connect),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
+# bench("Connect (1)", benchmark,
+#       init = coordinates -> init_rssi_to_adjacency(coordinates, greedy.greedy_connect),
+#       unroll = (mesh, minutes) -> start(mesh; minutes))
 
-bench("Dominator (1)", benchmark,
-      init = coordinates -> init_rssi_to_adjacency(coordinates, dominator.dominator),
-      unroll = (mesh, minutes) -> start(mesh; minutes))
+# bench("Dominator (1)", benchmark,
+#       init = coordinates -> init_rssi_to_adjacency(coordinates, dominator.dominator),
+#       unroll = (mesh, minutes) -> start(mesh; minutes))
 
 @load "model.bson" model
 
